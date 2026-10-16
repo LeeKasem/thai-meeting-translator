@@ -202,3 +202,7 @@ translator/usage.py     session and monthly usage counter
 translator/ui.py        Tkinter window
 tests/test_core.py      unit tests
 ```
+
+## License
+
+[MIT](LICENSE)
