@@ -3,6 +3,8 @@
 
 # Meeting content and local usage counter
 transcripts/
+logs/
+results/
 usage.json
 *.tmp
 

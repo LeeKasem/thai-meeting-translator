@@ -93,12 +93,12 @@ class TtsBacklogTest(unittest.TestCase):
                      on_spoken_chars=lambda n: None, on_error=lambda m: None, max_backlog=2)
         q._running = True  # no worker thread: just exercise the queue policy
         for i in range(5):
-            q.enqueue(f"s{i}")
-        self.assertEqual(list(q._q), ["s3", "s4"])
+            q.enqueue(f"s{i}", "th")
+        self.assertEqual([u.text for u in q._q], ["s3", "s4"])
         self.assertEqual(q.skipped, 3)
         self.assertEqual(seen[-1], (2, 3))
         q.set_muted(True)
-        q.enqueue("s5")
+        q.enqueue("s5", "th")
         self.assertEqual(q.waiting, 0)
 
 

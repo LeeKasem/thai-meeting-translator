@@ -11,11 +11,14 @@ Speech SDK, and TTS audio (24 kHz mono) is converted to the output's format.
 import queue
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 import numpy as np
 import pyaudiowpatch as pyaudio
+
+from .latency import StreamClock
 
 SDK_RATE = 16000
 LOOPBACK_SUFFIX = " [Loopback]"
@@ -166,18 +169,23 @@ class AudioCapture:
                 return (silence[:need] if need <= len(silence) else bytes(need),
                         pyaudio.paContinue)
 
-            self._keepalive = self.pa.open(
-                format=pyaudio.paInt16, channels=render_dev.channels,
-                rate=render_dev.rate, output=True,
-                output_device_index=render_dev.index,
-                frames_per_buffer=render_dev.rate // 10,
-                stream_callback=keepalive_cb,
+        try:
+            if dev.kind == "loopback" and render_dev is not None:
+                self._keepalive = self.pa.open(
+                    format=pyaudio.paInt16, channels=render_dev.channels,
+                    rate=render_dev.rate, output=True,
+                    output_device_index=render_dev.index,
+                    frames_per_buffer=render_dev.rate // 10,
+                    stream_callback=keepalive_cb,
+                )
+            self._in = self.pa.open(
+                format=pyaudio.paInt16, channels=dev.channels, rate=dev.rate,
+                input=True, input_device_index=dev.index,
+                frames_per_buffer=dev.rate // 10, stream_callback=callback,
             )
-        self._in = self.pa.open(
-            format=pyaudio.paInt16, channels=dev.channels, rate=dev.rate,
-            input=True, input_device_index=dev.index,
-            frames_per_buffer=dev.rate // 10, stream_callback=callback,
-        )
+        except Exception:
+            self.stop()  # don't leave the keepalive open if the input failed
+            raise
 
     def stop(self) -> None:
         for s in (self._in, self._keepalive):
@@ -193,27 +201,63 @@ class AudioCapture:
 class AudioPump:
     """Moves captured audio to the current SDK push stream on its own thread.
 
-    - The sink (push stream) can be swapped during reconnects.
-    - While `is_paused()` is true (TTS speaking), silence is sent instead of
-      the captured audio, so the app never hears its own voice and the
-      session stays alive.
+    - Feedback protection: `is_paused()` is checked when a chunk is *captured*
+      (in `feed`), not when the pump thread gets to it, so queueing delay can't
+      let TTS audio slip through after the gate reopens. Gated chunks become
+      silence, which keeps the recognizer session alive.
+    - The sink (push stream) can be swapped during reconnects and direction
+      switches. While there is no sink, audio is buffered (up to
+      `buffer_s` seconds) and flushed into the next sink, so speech that
+      starts while the recognizer is reopening isn't lost.
     - Counts the audio actually sent (that's what Azure bills).
+    - Latency: each chunk carries its capture time; every sink gets a
+      StreamClock mapping stream position -> capture time (returned by
+      set_sink), so a result's audio offset gives the real end-of-speech time
+      even for audio that waited in the buffer.
     """
 
-    def __init__(self, is_paused: Callable[[], bool]):
-        self._q: "queue.Queue[Optional[bytes]]" = queue.Queue()
+    def __init__(self, is_paused: Callable[[], bool], buffer_s: float = 5.0):
+        self._q: "queue.Queue[Optional[tuple]]" = queue.Queue()  # (chunk, captured_at)
         self._sink = None
+        self._clock: Optional[StreamClock] = None
         self._lock = threading.Lock()
         self._is_paused = is_paused
+        self._pending: "deque[tuple]" = deque()
+        self._pending_bytes = 0
+        self._max_pending = int(buffer_s * SDK_RATE * 2)
         self.bytes_sent = 0
+        self.bytes_dropped = 0
         self._thread: Optional[threading.Thread] = None
 
     def feed(self, chunk: bytes) -> None:
-        self._q.put(chunk)
+        """Called from the capture callback: keep it cheap."""
+        try:
+            gated = self._is_paused()
+        except Exception:
+            gated = True  # fail closed: never risk feeding our own voice back
+        self._q.put((bytes(len(chunk)) if gated else chunk, time.monotonic()))
 
-    def set_sink(self, sink) -> None:
+    def set_sink(self, sink) -> Optional[StreamClock]:
+        """Returns the new sink's clock (None when clearing the sink)."""
         with self._lock:
             self._sink = sink
+            if sink is None:
+                self._clock = None
+                return None
+            clock = self._clock = StreamClock()
+            while self._pending:
+                chunk, at = self._pending.popleft()
+                self._pending_bytes -= len(chunk)
+                if not self._write(chunk, at):
+                    break
+            self._pending.clear()
+            self._pending_bytes = 0
+            return clock
+
+    def clear_buffer(self) -> None:
+        with self._lock:
+            self._pending.clear()
+            self._pending_bytes = 0
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="audio-pump", daemon=True)
@@ -223,51 +267,87 @@ class AudioPump:
         self._q.put(None)
         if self._thread:
             self._thread.join(timeout=2)
+        self.clear_buffer()
 
     @property
     def seconds_sent(self) -> float:
         return self.bytes_sent / (SDK_RATE * 2)
 
+    def _write(self, chunk: bytes, captured_at: float) -> bool:
+        """Call with the lock held."""
+        try:
+            self._sink.write(chunk)
+        except Exception:  # stream already closed by a reconnect/stop
+            return False
+        self.bytes_sent += len(chunk)
+        if self._clock is not None:
+            self._clock.add(len(chunk), captured_at)
+        return True
+
     def _run(self) -> None:
         while True:
-            chunk = self._q.get()
-            if chunk is None:
+            item = self._q.get()
+            if item is None:
                 return
-            if self._is_paused():
-                chunk = bytes(len(chunk))
+            chunk, at = item
             with self._lock:
-                if self._sink is None:
-                    continue  # between recognizers; drop
-                try:
-                    self._sink.write(chunk)
-                except Exception:  # stream already closed by a reconnect/stop
+                if self._sink is not None:
+                    self._write(chunk, at)
                     continue
-            self.bytes_sent += len(chunk)
+                # Between recognizers: keep the most recent audio.
+                self._pending.append(item)
+                self._pending_bytes += len(chunk)
+                while self._pending_bytes > self._max_pending:
+                    old, _ = self._pending.popleft()
+                    self._pending_bytes -= len(old)
+                    self.bytes_dropped += len(old)
 
 
 class Player:
-    """Plays mono int16 PCM on a chosen output device, interruptibly."""
+    """Plays mono int16 PCM on a chosen output device, interruptibly.
+
+    `play()` and `close()` share a lock so the stream is never closed while a
+    write is in flight. Callers set the cancel event first; `play()` then
+    returns within one 100 ms block. `close()` aborts the stream (discarding
+    anything still buffered) instead of draining it, so nothing is heard
+    after Stop.
+    """
 
     def __init__(self, pa: "pyaudio.PyAudio", dev: Device):
         self.dev = dev
+        self._lock = threading.Lock()
+        self._closed = False
         self._stream = pa.open(
             format=pyaudio.paInt16, channels=dev.channels, rate=dev.rate,
             output=True, output_device_index=dev.index,
         )
+        try:  # PortAudio's estimate of write -> sound; used in latency logs
+            self.output_latency = float(self._stream.get_output_latency())
+        except Exception:
+            self.output_latency = 0.0
 
-    def play(self, pcm: bytes, rate: int, cancel: threading.Event) -> None:
+    def play(self, pcm: bytes, rate: int, cancel: threading.Event) -> bool:
+        """Returns True if the whole clip was played."""
         data = convert_for_output(pcm, rate, self.dev.rate, self.dev.channels)
         step = self.dev.rate // 10 * self.dev.channels * 2  # 100 ms
-        for i in range(0, len(data), step):
-            if cancel.is_set():
-                return
-            self._stream.write(data[i:i + step])
-        # write() returns when the last block is queued; let it drain.
-        time.sleep(0.15)
+        with self._lock:
+            if self._closed:
+                return False
+            for i in range(0, len(data), step):
+                if cancel.is_set():
+                    return False
+                self._stream.write(data[i:i + step])
+            # write() returns when the last block is queued; let it drain.
+            return not cancel.wait(0.15)
 
     def close(self) -> None:
-        try:
-            self._stream.stop_stream()
-            self._stream.close()
-        except OSError:
-            pass
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                # Pa_CloseStream on an active stream aborts it: pending buffers
+                # are discarded rather than played out (stop_stream would drain).
+                self._stream.close()
+            except OSError:
+                pass

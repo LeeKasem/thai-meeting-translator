@@ -24,7 +24,9 @@ def _srt_time(seconds: float) -> str:
 
 
 def _txt_entry(seg: Segment) -> str:
-    return f"[{_clock(seg.start)}]\nEN: {seg.english}\nTH: {seg.thai}\n\n"
+    src, tgt = seg.source_lang.upper(), seg.target_lang.upper()
+    return (f"[{_clock(seg.start)}] {src} -> {tgt}\n"
+            f"{src}: {seg.source_text}\n{tgt}: {seg.translated_text}\n\n")
 
 
 class Transcript:
@@ -35,7 +37,7 @@ class Transcript:
         stamp = datetime.fromtimestamp(session_start).strftime("%Y%m%d_%H%M%S")
         self.txt_path = directory / f"meeting_{stamp}.txt"
         self.srt_path = directory / f"meeting_{stamp}.srt"
-        self._header = (f"Meeting transcript (English -> Thai), started "
+        self._header = (f"Meeting transcript (English <-> Thai), started "
                         f"{datetime.fromtimestamp(session_start):%Y-%m-%d %H:%M:%S}\n"
                         f"Machine translation: an aid, not an official record.\n\n")
 
@@ -60,7 +62,7 @@ class Transcript:
         for i, s in enumerate(self.segments, 1):
             start = s.start - self.session_start
             end = max(s.end - self.session_start, start + 1.0)
-            blocks.append(f"{i}\n{_srt_time(start)} --> {_srt_time(end)}\n{s.thai}\n{s.english}\n")
+            blocks.append(f"{i}\n{_srt_time(start)} --> {_srt_time(end)}\n{s.translated_text}\n{s.source_text}\n")
         return "\n".join(blocks)
 
     def export(self, path: Path) -> None:

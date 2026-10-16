@@ -1,0 +1,36 @@
+# Test phrases for tools/measure.py. Columns (tab-separated):
+#   id  lang  category  text
+# lang = the language the phrase is MOSTLY in (the one auto-detect should pick).
+# Categories: normal, short, number, name, mixed (Thai with English words or
+# English with Thai names). Order alternates languages on purpose, with a few
+# same-language runs, so continuous language ID has to switch back and forth.
+e1	en	normal	Good morning everyone, thank you for joining the meeting today.
+t1	th	normal	สวัสดีครับ ขอบคุณทุกคนที่มาประชุมวันนี้
+e2	en	normal	Could you send me the updated schedule by Friday?
+t2	th	normal	ช่วยส่งตารางงานที่อัปเดตให้ภายในวันศุกร์ได้ไหมครับ
+s1	en	short	Yes.
+s2	th	short	ครับ
+e3	en	normal	We need to finish the installation before the end of the month.
+e4	en	normal	I think the second option is cheaper, but it takes longer.
+t3	th	normal	เราต้องติดตั้งให้เสร็จก่อนสิ้นเดือนนี้
+t4	th	normal	ผมคิดว่าตัวเลือกที่สองถูกกว่า แต่ใช้เวลานานกว่า
+n1	en	number	The total cost is two thousand four hundred and fifty baht.
+n2	th	number	ราคารวมทั้งหมดสามพันห้าร้อยบาทครับ
+s3	en	short	Okay, sounds good.
+s4	th	short	ได้ค่ะ
+m1	th	mixed	ขอ check ตัวเลขใน report อีกครั้งนะครับ
+e5	en	normal	Please check the delivery address with the customer.
+t5	th	normal	กรุณาตรวจสอบที่อยู่จัดส่งกับลูกค้าอีกครั้ง
+a1	en	name	Our meeting with Khun Somchai is on the fifteenth of November at two p.m.
+a2	th	name	นัดประชุมกับคุณจอห์นวันที่สิบห้าพฤศจิกายน บ่ายสองโมง
+s5	en	short	No, not yet.
+s6	th	short	ไม่ใช่ครับ
+m2	th	mixed	เดี๋ยวผมส่ง email ไปให้หลัง meeting นะครับ
+m3	en	mixed	Can we move the site visit in Chiang Mai to next Tuesday?
+n3	en	number	Please call me at zero eight one, two three four, five six seven eight.
+n4	th	number	เบอร์โทรศัพท์คือ ศูนย์แปดหนึ่ง สองสามสี่ ห้าหกเจ็ดแปด
+t6	th	normal	พักสักครู่แล้วค่อยประชุมต่อในอีกสิบนาที
+e6	en	normal	Let's take a short break and continue in ten minutes.
+m4	th	mixed	งาน project นี้ต้อง approve ก่อนวันจันทร์
+s7	en	short	Thank you.
+s8	th	short	ขอบคุณค่ะ

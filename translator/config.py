@@ -16,10 +16,70 @@ from dotenv import load_dotenv
 APP_DIR = Path(__file__).resolve().parent.parent
 TRANSCRIPT_DIR = APP_DIR / "transcripts"
 USAGE_FILE = APP_DIR / "usage.json"
+LOG_DIR = APP_DIR / "logs"  # per-session latency logs (latency-*.jsonl)
 
-SOURCE_LANGUAGE = "en-US"
-TARGET_LANGUAGE = "th"
-TTS_VOICE = "th-TH-NiwatNeural"
+
+@dataclass(frozen=True)
+class Language:
+    code: str    # translation code, also the key used everywhere else ("th")
+    locale: str  # recognition / SSML locale ("th-TH")
+    name: str
+
+
+LANGUAGES = {
+    "en": Language("en", "en-US", "English"),
+    "th": Language("th", "th-TH", "Thai"),
+}
+PAIR = ("en", "th")  # Language A <-> Language B
+
+# Direction modes. Manual modes fix source and target. AUTO lets Azure detect
+# which of the pair is being spoken per utterance and translates into the
+# other one (continuous language ID). AUTO is experimental until it has been
+# measured with real speech (accuracy and latency).
+MODE_EN_TH = "en>th"
+MODE_TH_EN = "th>en"
+MODE_AUTO = "auto"
+MODES = (MODE_EN_TH, MODE_TH_EN, MODE_AUTO)
+DEFAULT_MODE = MODE_EN_TH
+
+
+def direction(mode: str):
+    """(source, target) codes for a manual mode; None for MODE_AUTO."""
+    if mode == MODE_AUTO:
+        return None
+    src, _, tgt = mode.partition(">")
+    if src not in LANGUAGES or tgt not in LANGUAGES or src == tgt:
+        raise ValueError(f"unknown mode {mode!r}")
+    return src, tgt
+
+
+def other(lang: str) -> str:
+    a, b = PAIR
+    return b if lang == a else a
+
+
+def lang_for_locale(locale: str):
+    """'th-TH' -> 'th'; None if it isn't one of the pair."""
+    loc = (locale or "").strip().lower()
+    for code in PAIR:
+        if LANGUAGES[code].locale.lower() == loc:
+            return code
+    return None
+
+
+def mode_label(mode: str) -> str:
+    if mode == MODE_AUTO:
+        a, b = (LANGUAGES[c].name for c in PAIR)
+        return f"Auto-detect {a}/{b}"
+    src, tgt = direction(mode)
+    return f"{LANGUAGES[src].name} → {LANGUAGES[tgt].name}"
+
+
+# Voice per target language. Override in .env, e.g. TTS_VOICE_EN=en-US-AvaNeural.
+DEFAULT_VOICES = {
+    "en": "en-US-JennyNeural",
+    "th": "th-TH-NiwatNeural",
+}
 
 # Azure Speech Free (F0) monthly allowances, checked 2026-10-16 at
 # https://azure.microsoft.com/en-us/pricing/details/cognitive-services/speech-services/
@@ -35,10 +95,50 @@ MAX_RECONNECT_ATTEMPTS = 5
 RECONNECT_BACKOFF_S = (1, 2, 4, 8, 15)
 STABLE_SESSION_S = 60  # a session this long resets the retry counter
 
-# TTS: drop the oldest unspoken sentences beyond this many waiting.
+# TTS queue policy (see tts.py): meeting = catch up (drop the oldest unspoken
+# sentences beyond TTS_MAX_BACKLOG waiting); onsite = every sentence in order,
+# same-language waiting sentences merged into one request up to this size.
 TTS_MAX_BACKLOG = 2
+TTS_MERGE_MAX_CHARS = 400
+TTS_BEHIND_WARN_S = 15.0  # onsite: show "voice is N s behind" beyond this
+TTS_CACHE_ITEMS = 50      # synthesized utterances kept for instant replay
 # Extra time recognition stays paused after TTS ends (room echo tail).
 PAUSE_TAIL_S = 0.4
+
+# Direction switch: how long to wait for the old recognizer's last sentence,
+# and how much of the next speaker's audio to buffer meanwhile.
+SWITCH_FLUSH_TIMEOUT_S = 2.0
+SWITCH_BUFFER_S = 5.0
+
+# Onsite (one shared device): speakers in the room ring longer than headphones,
+# so the mic stays gated longer after the voice ends.
+ONSITE_TAIL_S = 0.7
+# After a translation has been read, give the floor to the other side.
+ONSITE_AUTO_ALTERNATE = True
+# Text-based echo guard: a final result this similar (0..1) to something the
+# voice said within ECHO_WINDOW_S is treated as the app hearing itself.
+ECHO_SIMILARITY = 0.8
+ECHO_WINDOW_S = 15.0
+
+# End-of-speech silence before Azure finalizes a sentence, in ms. Unset = the
+# service default. Shorter gives earlier translations but splits sentences at
+# pauses. Set SEGMENTATION_SILENCE_MS in .env to experiment (see step 5 notes
+# in README); the measurement tool has --silence-ms.
+SEGMENTATION_SILENCE_RANGE = (100, 5000)
+
+
+def segmentation_silence_ms():
+    raw = os.environ.get("SEGMENTATION_SILENCE_MS", "").strip()
+    if not raw:
+        return None
+    try:
+        ms = int(raw)
+    except ValueError:
+        raise ConfigError(f"SEGMENTATION_SILENCE_MS='{raw}' must be a whole number of ms.")
+    lo, hi = SEGMENTATION_SILENCE_RANGE
+    if not lo <= ms <= hi:
+        raise ConfigError(f"SEGMENTATION_SILENCE_MS must be between {lo} and {hi}.")
+    return ms
 
 
 class ConfigError(Exception):
@@ -66,6 +166,26 @@ def load_credentials() -> Credentials:
             "Use the short form shown in the Azure portal, e.g. 'southeastasia'."
         )
     return Credentials(key, region)
+
+
+def load_voices() -> dict:
+    """Voice name per language: DEFAULT_VOICES overridden by TTS_VOICE_<CODE>.
+
+    A voice must belong to its language's locale family (th-* for Thai) unless
+    it is a Multilingual voice, so a typo can't make English text be read by
+    the Thai voice or vice versa."""
+    load_dotenv(APP_DIR / ".env")
+    voices = {}
+    for code in PAIR:
+        name = os.environ.get(f"TTS_VOICE_{code.upper()}", "").strip() or DEFAULT_VOICES[code]
+        if not re.fullmatch(r"[a-z]{2,3}-[A-Za-z]{2,4}(-[A-Za-z]+)?-[A-Za-z0-9]+", name):
+            raise ConfigError(f"TTS_VOICE_{code.upper()}='{name}' doesn't look like an Azure "
+                              "voice name, e.g. 'en-US-JennyNeural'.")
+        if not name.lower().startswith(code + "-") and "multilingual" not in name.lower():
+            raise ConfigError(f"TTS_VOICE_{code.upper()}='{name}' is not a "
+                              f"{LANGUAGES[code].name} voice.")
+        voices[code] = name
+    return voices
 
 
 def preflight_check(creds: Credentials, timeout: float = 8.0) -> None:
