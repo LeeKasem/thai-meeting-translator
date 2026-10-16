@@ -1,0 +1,12 @@
+# Secrets
+.env
+
+# Meeting content and local usage counter
+transcripts/
+usage.json
+*.tmp
+
+# Python
+.venv/
+__pycache__/
+*.pyc
