@@ -1,5 +1,9 @@
 """Tkinter UI. All SDK/audio callbacks run on other threads and reach Tk only
-through `post()`, which the Tk main loop drains every 50 ms."""
+through `post()`, which the Tk main loop drains every 50 ms.
+
+Look and feel: design tokens in theme.py, components in widgets.py,
+messages.py and voice_picker.py. This module wires them to the session
+logic (start/stop, recognition, TTS, onsite turn-taking)."""
 import logging
 import queue
 import threading
@@ -7,35 +11,51 @@ import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, font as tkfont, messagebox, ttk
-from tkinter.scrolledtext import ScrolledText
+from tkinter import filedialog, messagebox
 from typing import Optional
 
 import pyaudiowpatch as pyaudio
 
-from . import config
+from . import config, paint, theme, voices, winmic
 from .audio import AudioCapture, AudioPump, Device, Player, list_devices
 from .latency import LatencyLog
+from .messages import MessageList
 from .onsite import EchoFilter, Phase, TurnTaker, phase_of
 from .recognition import RecognitionController, Segment
 from .session import Cancelled, Session, State, StateMachine
 from .transcript import Transcript
 from .tts import POLICY_CATCH_UP, POLICY_IN_ORDER, TtsQueue
 from .usage import Usage
+from .voice_picker import VoicePicker
+from .widgets import (C, S, Banner, Button, Chip, IconButton, Modal, Overlay, PillSelect, PillTabs,
+                      Popover, RecordButton, SettingRow, Toggle)
 
-STATUS_COLORS = {"idle": "#555555", "connecting": "#1f5fa8", "listening": "#1b7a2e",
-                 "reconnecting": "#b36b00", "error": "#b00020", "stopping": "#555555"}
+# Status line colour per recognizer/app state (theme token names).
+STATUS_TOKENS = {"idle": "text_2", "connecting": "primary", "listening": "success",
+                 "reconnecting": "warning", "error": "danger_active", "stopping": "text_2"}
 
 SIDE_LABEL = {"en": "English speaker · ผู้พูดอังกฤษ", "th": "ผู้พูดภาษาไทย · Thai speaker"}
-# Onsite banner per phase: (background, text). Bilingual: both people read it.
+FLOOR_TABS = (("en", "English · อังกฤษ", "mic"), ("th", "ไทย · Thai", "mic"))
+# Onsite banner per phase: (colour token, text). Bilingual: both people read it.
 PHASE_BANNER = {
-    Phase.LISTENING: ("#1b7a2e", {"en": "🎤  English speaker: please speak   ·   ผู้พูดภาษาอังกฤษ พูดได้เลย",
-                                  "th": "🎤  ผู้พูดภาษาไทย พูดได้เลย   ·   Thai speaker: please speak"}),
-    Phase.SWITCHING: ("#1f5fa8", "⏳  Switching turn… you can start speaking   ·   กำลังสลับผู้พูด… เริ่มพูดได้"),
-    Phase.TRANSLATING: ("#b36b00", "…  Translating   ·   กำลังแปล"),
-    Phase.SPEAKING: ("#b00020", "🔊  Reading the translation: please wait   ·   กำลังอ่านคำแปล กรุณารอ"),
-    Phase.TAIL: ("#b00020", "🔊  Reading the translation: please wait   ·   กำลังอ่านคำแปล กรุณารอ"),
+    Phase.LISTENING: ("success", {"en": "English speaker: please speak   ·   ผู้พูดภาษาอังกฤษ พูดได้เลย",
+                                  "th": "ผู้พูดภาษาไทย พูดได้เลย   ·   Thai speaker: please speak"}),
+    Phase.SWITCHING: ("primary", "Switching turn… you can start speaking   ·   กำลังสลับผู้พูด… เริ่มพูดได้"),
+    Phase.TRANSLATING: ("warning", "Translating   ·   กำลังแปล"),
+    Phase.SPEAKING: ("danger_active", "Reading the translation: please wait   ·   กำลังอ่านคำแปล กรุณารอ"),
+    Phase.TAIL: ("danger_active", "Reading the translation: please wait   ·   กำลังอ่านคำแปล กรุณารอ"),
 }
+PHASE_IDLE = "Press the mic, then the person speaking taps their side   ·   กดไมค์ แล้วกดฝั่งของผู้พูด"
+
+
+def phase_color(phase: Phase) -> str:
+    return C(PHASE_BANNER[phase][0])
+
+
+# Language row: the source picker includes auto-detect; the target follows.
+SRC_LABELS = {config.MODE_AUTO: "Auto-detect (beta)", "en": "English", "th": "Thai"}
+TGT_AUTO_LABEL = "The other language"
+SOURCE_TABS = (("loopback", "System audio", "headphones"), ("mic", "Microphone", "mic"))
 
 
 class App:
@@ -56,14 +76,22 @@ class App:
         self.turn = TurnTaker()
         self.echo: Optional[EchoFilter] = None
         self._onsite_live = False
-        # Every final sentence shown in History, by id, for replay.
+        # Every final sentence shown in the conversation, by id, for replay.
         self._segs: dict = {}
         self._last_seg_id: Optional[int] = None
         self._last_usage_save = time.monotonic()
+        # Live-state inputs for the record button (written by other threads)
+        self._level = 0.0
+        self._playing_ids: tuple = ()
+        self._status_state = "idle"
+        self._interim_at = 0.0
+        self._voice_choice = voices.chosen()
+        self._picker: Optional[VoicePicker] = None
+        self._options_open_before = True
 
-        self._setup_fonts()
         self._build()
         self.refresh_devices()
+        self._apply_setting()
         self._update_usage_label()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.after(50, self._drain)
@@ -71,175 +99,307 @@ class App:
         root.after(100, self._onsite_tick)
         root.bind_all("<F1>", lambda e: self._give_floor("en"))
         root.bind_all("<F2>", lambda e: self._give_floor("th"))
-        root.bind_all("<Escape>", lambda e: self._skip_voice())
+        root.bind_all("<Escape>", self._on_escape)
         root.bind_all("<F3>", lambda e: self._replay_last())
 
     # ---------------------------------------------------------------- layout
-    def _setup_fonts(self):
-        families = set(tkfont.families(self.root))
-        thai = next((f for f in ("Leelawadee UI", "Leelawadee", "Tahoma") if f in families), "TkDefaultFont")
-        # Per language: big caption font, small (source line) font, history font.
-        self.f_big = {"th": tkfont.Font(family=thai, size=26),
-                      "en": tkfont.Font(family="Segoe UI", size=22)}
-        self.f_sub = {"th": tkfont.Font(family=thai, size=14),
-                      "en": tkfont.Font(family="Segoe UI", size=13)}
-        self.f_hist = {"th": tkfont.Font(family=thai, size=13),
-                       "en": tkfont.Font(family="Segoe UI", size=11)}
-        self.f_small = tkfont.Font(family="Segoe UI", size=10)
-
     def _build(self):
         r = self.root
         r.title("Meeting Translator: English ⇄ Thai")
-        r.geometry("1000x760")
-        r.minsize(760, 560)
+        sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
+        w, h = min(S(860), sw - S(40)), min(S(960), sh - S(140))  # clear of the taskbar
+        r.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{S(20)}")
+        r.minsize(S(360), S(560))
+        r.configure(bg=C("page_a"))
+        theme.dark_title_bar(r, theme.T.dark)
 
-        top = ttk.Frame(r, padding=(10, 8, 10, 0))
-        top.pack(fill="x")
+        # Page: gradient + card shadows are one image; frames sit on top.
+        self.page = tk.Canvas(r, highlightthickness=0, bd=0, bg=C("page_a"))
+        self.page.place(x=0, y=0, relwidth=1, relheight=1)
+        self._page_img = self.page.create_image(0, 0, anchor="nw")
+        self.nav = tk.Frame(self.page, bg=C("bg"))
+        self.card = tk.Frame(self.page, bg=C("bg"))
+        self._nav_win = self.page.create_window(0, 0, anchor="nw", window=self.nav)
+        self._card_win = self.page.create_window(0, 0, anchor="nw", window=self.card)
+        self._page_job = None
+        self._page_size = (0, 0)
+        self.page.bind("<Configure>", self._on_page_resize)
+
+        self._build_nav(self.nav)
+        self._build_card(self.card)
+
+    def _build_nav(self, nav):
+        bg = C("bg")
+        left = tk.Frame(nav, bg=bg)
+        left.pack(side="left", padx=(S(12), 0), pady=S(8))
+        logo = tk.Canvas(left, width=S(36), height=S(36), bg=bg, highlightthickness=0, bd=0)
+        logo.pack(side="left")
+        logo.create_image(S(18), S(18), image=paint.circle(S(36), C("primary_10"), bg))
+        logo.create_text(S(18), S(18), text=theme.T.icon("translate"),
+                         font=theme.T.icon_font(16), fill=C("primary"))
+        self.nav_title = tk.Label(left, text="Meeting Translator", bg=bg, fg=C("text"),
+                                  font=theme.T.font(16, 700))
+        self.nav_title.pack(side="left", padx=(S(10), 0))
+        self.nav_pair = Chip(left, "EN ⇄ TH", C("bg_muted"), C("text_2"), fpx=12)
+        self.nav_pair.pack(side="left", padx=(S(10), 0))
+
+        right = tk.Frame(nav, bg=bg)
+        right.pack(side="right", padx=(0, S(8)), pady=S(6))
+        self.large_var = tk.BooleanVar(value=bool(voices.load_settings().get("large_text")))
+        self.large_btn = IconButton(right, "font", "Large text (for showing the screen to the "
+                                    "other person)", command=self._toggle_large, size=38,
+                                    toggled=self.large_var.get())
+        self.export_btn = IconButton(right, "download", "Export transcript (.txt or .srt)",
+                                     command=self._export_menu, size=38)
+        self.settings_btn = IconButton(right, "settings", "Settings, shortcuts and usage",
+                                       command=self._open_settings, size=38)
+        for w in (self.large_btn, self.export_btn, self.settings_btn):
+            w.pack(side="left", padx=S(1))
+
+    def _build_card(self, card):
+        bg = C("bg")
+        col = self.col = tk.Frame(card, bg=bg)
+        col.pack(fill="both", expand=True, padx=S(32), pady=(S(24), S(12)))
+        col.columnconfigure(0, weight=1)
+
+        head = self.head = tk.Frame(col, bg=bg)
+        head.grid(row=0, column=0, sticky="we")
+        tk.Label(head, text="Live translation", bg=bg, fg=C("text"), font=theme.T.font(28, 500),
+                 anchor="w").pack(fill="x")
+        self.subtitle = tk.Label(head, text="Speak English or Thai and hear the other language, live.",
+                                 bg=bg, fg=C("text_2"), font=theme.T.font(14), anchor="w",
+                                 justify="left")
+        self.subtitle.pack(fill="x", pady=(S(2), 0))
+
+        # Setting: meeting / onsite
         self.setting_var = tk.StringVar(value="meeting")
-        ttk.Label(top, text="Setting:").pack(side="left")
-        self.rb_meeting = ttk.Radiobutton(top, text="Meeting (remote or listening only)",
-                                          value="meeting", variable=self.setting_var,
-                                          command=self._apply_setting)
-        self.rb_onsite = ttk.Radiobutton(top, text="Onsite conversation (two people, one device)",
-                                         value="onsite", variable=self.setting_var,
-                                         command=self._apply_setting)
-        self.rb_meeting.pack(side="left", padx=(28, 0))
-        self.rb_onsite.pack(side="left", padx=(12, 0))
+        self.setting_tabs = PillTabs(col, (("meeting", "Meeting", "headphones"),
+                                           ("onsite", "Onsite", "people")),
+                                     self.setting_var, command=self._apply_setting, stretch=True,
+                                     label="Setting")
+        self.setting_tabs.grid(row=1, column=0, sticky="we", pady=(S(18), 0))
+        self.rb_meeting = self.setting_tabs.option("meeting")
+        self.rb_onsite = self.setting_tabs.option("onsite")
+        self.setting_hint = tk.Label(col, text="", bg=bg, fg=C("text_3"),
+                                     font=theme.T.font(12), anchor="w", justify="left")
+        self.setting_hint.grid(row=2, column=0, sticky="we", pady=(S(4), 0))
 
-        ctl = ttk.Frame(r, padding=(10, 8))
-        ctl.pack(fill="x")
+        # Language row (meeting) / floor (onsite) share row 3.
+        self.mode_var = tk.StringVar(value=config.DEFAULT_MODE)
+        self.lang_row = tk.Frame(col, bg=bg)
+        self.lang_row.grid(row=3, column=0, sticky="we", pady=(S(10), 0))
+        self.lang_row.columnconfigure(0, weight=1, uniform="lang")
+        self.lang_row.columnconfigure(2, weight=1, uniform="lang")
+        self.src_select = PillSelect(self.lang_row, list(SRC_LABELS.values()), icon="globe",
+                                     command=self._on_src_pick, label="Spoken language")
+        self.src_select.grid(row=0, column=0, sticky="we")
+        self.swap_btn = IconButton(self.lang_row, "swap", "Swap languages", command=self._swap,
+                                   size=40, variant="secondary")
+        self.swap_btn.grid(row=0, column=1, padx=S(6))
+        self.tgt_select = PillSelect(self.lang_row, [config.LANGUAGES[c].name for c in config.PAIR],
+                                     icon="speaker", command=self._on_tgt_pick,
+                                     label="Translate into")
+        self.tgt_select.grid(row=0, column=2, sticky="we")
+        self.mode_rbs = [self.src_select, self.swap_btn, self.tgt_select]
+        self.mode_var.trace_add("write", lambda *a: self._sync_lang_row())
+
+        self.turn_frame = tk.Frame(col, bg=bg)
+        self._build_turn_panel(self.turn_frame)
+
+        self.warn_label = Banner(col, "", tone="warning")
+        self.warn_label.grid(row=4, column=0, sticky="we", pady=(S(10), 0))
+
+        self._build_options(col)
+
+        self.messages = MessageList(col, on_replay=self._replay)
+        self.messages.grid(row=6, column=0, sticky="nsew", pady=(S(12), 0))
+        self._head_hidden = False
+        self._fit_job = None
+        self.messages.bind("<Configure>", lambda e: self._schedule_fit(), add="+")
+        col.rowconfigure(6, weight=1)
+        self.messages.set_large(self.large_var.get())
+
+        rec = tk.Frame(col, bg=bg)
+        rec.grid(row=7, column=0, sticky="we", pady=(S(6), 0))
+        self.record_btn = RecordButton(rec, command=self._on_record)
+        self.record_btn.pack()
+        self.status_label = tk.Label(rec, text="Ready", bg=bg, fg=C("text_2"),
+                                     font=theme.T.font(13, 500), justify="center")
+        self.status_label.pack(fill="x")
+        self.queue_label = tk.Label(rec, text="Voice queue: 0", bg=bg, fg=C("text_3"),
+                                    font=theme.T.font(12), justify="center")
+        self.queue_label.pack(fill="x", pady=(S(2), 0))
+        self.usage_label = tk.Label(rec, text="", bg=bg, fg=C("text_3"), font=theme.T.font(11),
+                                    justify="center")
+        self.usage_label.pack(fill="x", pady=(S(2), 0))
+        col.bind("<Configure>", self._on_col_resize)
+        self._sync_lang_row()
+        # Collapsed by default so the conversation and the mic always fit;
+        # the summary line shows the current choices.
+        self._set_options_open(False)
+        self._options_open_before = False
+
+    def _build_options(self, col):
+        bg = C("bg")
+        box = self.options = tk.Frame(col, bg=bg)
+        box.grid(row=5, column=0, sticky="we", pady=(S(8), 0))
+        box.columnconfigure(0, weight=1)
+        self.options_btn = Button(box, "Audio and voice", icon="settings",
+                                  icon_right="chevron_up", variant="ghost", size="sm",
+                                  command=self._toggle_options)
+        self.options_btn.grid(row=0, column=0, sticky="w")
+        self.options_summary = tk.Label(box, text="", bg=bg, fg=C("text_3"),
+                                        font=theme.T.font(12), anchor="e")
+        self.options_summary.grid(row=0, column=1, sticky="e")
+        body = self.options_body = tk.Frame(box, bg=bg)
+        body.grid(row=1, column=0, columnspan=2, sticky="we")
+        body.columnconfigure(0, weight=1)
+        self.options_open = True
 
         self.source_var = tk.StringVar(value="loopback")
-        ttk.Label(ctl, text="Listen to:").grid(row=0, column=0, sticky="w")
-        src = ttk.Frame(ctl)
-        src.grid(row=0, column=1, columnspan=3, sticky="w")
-        self.rb_loop = ttk.Radiobutton(src, text="System audio (Teams/Zoom/Meet)", value="loopback",
-                                       variable=self.source_var, command=self._on_source_change)
-        self.rb_mic = ttk.Radiobutton(src, text="Microphone (in-room)", value="mic",
-                                      variable=self.source_var, command=self._on_source_change)
-        self.rb_loop.pack(side="left")
-        self.rb_mic.pack(side="left", padx=(12, 0))
+        row = SettingRow(body, "Listen to", info="System audio captures what your PC plays "
+                         "(Teams, Zoom, Meet). Microphone listens to the room.")
+        row.grid(row=0, column=0, sticky="we")
+        self.source_tabs = PillTabs(row.right, SOURCE_TABS, self.source_var,
+                                    command=self._on_source_change, size="sm", label="Listen to")
+        self.source_tabs.pack()
+        self.rb_loop = self.source_tabs.option("loopback")
+        self.rb_mic = self.source_tabs.option("mic")
 
-        ttk.Label(ctl, text="Input device:").grid(row=1, column=0, sticky="w", pady=2)
-        self.in_combo = ttk.Combobox(ctl, state="readonly", width=60)
-        self.in_combo.grid(row=1, column=1, sticky="we", pady=2)
-        self.in_combo.bind("<<ComboboxSelected>>", lambda e: self._update_feedback_warning())
+        dev = tk.Frame(body, bg=bg)
+        dev.grid(row=1, column=0, sticky="we", pady=(S(4), 0))
+        dev.columnconfigure(0, weight=1, uniform="dev")
+        dev.columnconfigure(1, weight=1, uniform="dev")
+        self.in_combo = PillSelect(dev, icon="mic", label="Input device",
+                                   command=lambda v: self._update_feedback_warning())
+        self.in_combo.grid(row=0, column=0, sticky="we", padx=(0, S(4)))
+        self.out_combo = PillSelect(dev, icon="speaker", label="Voice output device",
+                                    command=lambda v: self._update_feedback_warning())
+        self.out_combo.grid(row=0, column=1, sticky="we", padx=(S(4), 0))
+        self.refresh_btn = IconButton(dev, "refresh", "Refresh devices", command=self.refresh_devices,
+                                      size=40, variant="secondary")
+        self.refresh_btn.grid(row=0, column=2, padx=(S(6), 0))
 
-        ttk.Label(ctl, text="Voice output:").grid(row=2, column=0, sticky="w", pady=2)
-        self.out_combo = ttk.Combobox(ctl, state="readonly", width=60)
-        self.out_combo.grid(row=2, column=1, sticky="we", pady=2)
-        self.out_combo.bind("<<ComboboxSelected>>", lambda e: self._update_feedback_warning())
-        self.refresh_btn = ttk.Button(ctl, text="Refresh devices", command=self.refresh_devices)
-        self.refresh_btn.grid(row=1, column=2, rowspan=2, padx=8)
-        ctl.columnconfigure(1, weight=1)
-
-        # Direction can be changed while running (the recognizer reopens).
-        self.mode_var = tk.StringVar(value=config.DEFAULT_MODE)
-        ttk.Label(ctl, text="Direction:").grid(row=3, column=0, sticky="w", pady=2)
-        modes = ttk.Frame(ctl)
-        modes.grid(row=3, column=1, columnspan=3, sticky="w", pady=2)
-        self.mode_rbs = []
-        for m in config.MODES:
-            text = config.mode_label(m) + (" (experimental)" if m == config.MODE_AUTO else "")
-            rb = ttk.Radiobutton(modes, text=text, value=m, variable=self.mode_var,
-                                 command=self._on_mode_change)
-            rb.pack(side="left", padx=(0, 12))
-            self.mode_rbs.append(rb)
-
-        btns = ttk.Frame(ctl)
-        btns.grid(row=4, column=0, columnspan=4, sticky="we", pady=(6, 0))
-        self.start_btn = ttk.Button(btns, text="▶ Start", command=self.on_start)
-        self.stop_btn = ttk.Button(btns, text="■ Stop", command=self.on_stop, state="disabled")
-        self.start_btn.pack(side="left")
-        self.stop_btn.pack(side="left", padx=(6, 16))
         self.mute_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(btns, text="Mute voice (script only)", variable=self.mute_var,
-                        command=self._on_mute).pack(side="left")
+        row = SettingRow(body, "Mute voice", sub="Captions only. Nothing is spoken.")
+        row.grid(row=2, column=0, sticky="we", pady=(S(4), 0))
+        Toggle(row.right, self.mute_var, command=self._on_mute, label="Mute voice").pack()
+
         self.pause_var = tk.BooleanVar(value=False)
-        self.pause_cb = ttk.Checkbutton(btns, text="Pause listening while voice speaks",
-                                        variable=self.pause_var, command=self._on_pause_opt)
-        self.pause_cb.pack(side="left", padx=(12, 0))
-        self.replay_btn = ttk.Button(btns, text="↻ Replay last [F3]", command=self._replay_last)
-        self.replay_btn.pack(side="left", padx=(12, 0))
-        ttk.Button(btns, text="Export .srt", command=lambda: self.export(".srt")).pack(side="right")
-        ttk.Button(btns, text="Export .txt", command=lambda: self.export(".txt")).pack(side="right", padx=6)
+        row = SettingRow(body, "Pause listening while the voice speaks",
+                         info="Stops the app hearing and re-translating its own voice when it "
+                              "plays where it is listening. Always on in Onsite.")
+        row.grid(row=3, column=0, sticky="we")
+        self.pause_cb = Toggle(row.right, self.pause_var, command=self._on_pause_opt,
+                               label="Pause listening while the voice speaks")
+        self.pause_cb.pack()
 
-        self.warn_label = tk.Label(r, text="", fg="#b00020", font=self.f_small, anchor="w",
-                                   justify="left")
-        self.warn_label.pack(fill="x", padx=10)
+        row = SettingRow(body, "Select a voice")
+        row.grid(row=4, column=0, sticky="we")
+        self.voice_btn = Button(row.right, self._voice_summary(), icon="voice",
+                                icon_right="chevron_down", variant="soft", size="sm",
+                                command=self._open_voice_picker, max_text_w=220,
+                                tooltip="Choose the English and Thai voices")
+        self.voice_btn.pack()
 
-        self._build_turn_panel(r)
-
-        cap = tk.Frame(r, bg="white", highlightthickness=1, highlightbackground="#cccccc")
-        cap.pack(fill="x", padx=10, pady=6)
-        self.cap_frame = cap
-        # main_label: the translation (big); sub_label: what was said.
-        self.main_label = tk.Label(cap, text="กด Start เพื่อเริ่มแปล", font=self.f_big["th"],
-                                   bg="white", fg="#999999", anchor="w", justify="left", height=3)
-        self.main_label.pack(fill="x", padx=12, pady=(8, 0))
-        self.sub_label = tk.Label(cap, text="Press Start to begin.", font=self.f_sub["en"],
-                                  bg="white", fg="#999999", anchor="w", justify="left", height=2)
-        self.sub_label.pack(fill="x", padx=12, pady=(0, 8))
-        cap.bind("<Configure>", self._on_caption_resize)
-
-        ttk.Label(r, text="History", font=self.f_small).pack(anchor="w", padx=10)
-        self.history = ScrolledText(r, wrap="word", height=12, state="disabled", padx=8, pady=6)
-        self.history.pack(fill="both", expand=True, padx=10)
-        self.history.tag_configure("time", foreground="#888888", font=self.f_small)
-        self.history.tag_configure("replay", foreground="#1f5fa8", font=self.f_small)
-        self.history.tag_bind("replay", "<Button-1>", self._on_history_click)
-        self.history.tag_bind("replay", "<Enter>", lambda e: self.history.configure(cursor="hand2"))
-        self.history.tag_bind("replay", "<Leave>", lambda e: self.history.configure(cursor=""))
-        for code, f in self.f_hist.items():
-            self.history.tag_configure(code, font=f)  # font by language
-        self.history.tag_configure("src", foreground="#444444")  # colour by role
-        self.history.tag_configure("tgt", foreground="#000000")
-        self.history.tag_configure("arrow", foreground="#888888")
-        self.history.tag_configure("note", font=self.f_small, foreground="#1f5fa8")
-
-        bar = ttk.Frame(r, padding=(10, 4))
-        bar.pack(fill="x")
-        self.status_label = tk.Label(bar, text="Ready", fg=STATUS_COLORS["idle"], font=self.f_small,
-                                     anchor="w", justify="left")
-        self.status_label.pack(side="left", fill="x", expand=True)
-        self.queue_label = tk.Label(bar, text="Voice queue: 0", font=self.f_small)
-        self.queue_label.pack(side="right", padx=(12, 0))
-        self.usage_label = tk.Label(r, text="", font=self.f_small, anchor="w", padx=10)
-        self.usage_label.pack(fill="x", pady=(0, 6))
-
-    def _build_turn_panel(self, r):
+    def _build_turn_panel(self, f):
         """Onsite only: who has the floor, and what the device is doing."""
-        f = self.turn_frame = tk.Frame(r, padx=10, pady=4)
-        row = tk.Frame(f)
-        row.pack(fill="x")
-        big = tkfont.Font(family="Leelawadee UI", size=15, weight="bold")
-        self.floor_btns = {}
-        for side, key in (("en", "F1"), ("th", "F2")):
-            b = tk.Button(row, text=f"🎤  {SIDE_LABEL[side]}   [{key}]", font=big, relief="raised",
-                          padx=14, pady=8, command=lambda s=side: self._give_floor(s))
-            b.pack(side="left", padx=(0, 10))
-            self.floor_btns[side] = b
-        side_col = tk.Frame(row)
-        side_col.pack(side="right", fill="y")
-        tk.Button(side_col, text="↻  Replay / เล่นซ้ำ  [F3]", font=self.f_small, padx=8, pady=1,
-                  command=self._replay_last).pack(side="top", fill="x")
-        self.skip_btn = tk.Button(side_col, text="⏭  Skip voice / ข้าม  [Esc]", font=self.f_small,
-                                  padx=8, pady=1, command=self._skip_voice)
-        self.skip_btn.pack(side="top", fill="x", pady=(2, 0))
+        bg = C("bg")
+        f.columnconfigure(0, weight=1)
+        self.floor_var = tk.StringVar(value=self.turn.side)
+        self.floor_tabs = PillTabs(f, FLOOR_TABS, self.floor_var, stretch=True,
+                                   command=lambda: self._give_floor(self.floor_var.get()),
+                                   label="Who is speaking (F1 / F2)")
+        self.floor_tabs.grid(row=0, column=0, sticky="we")
+        self.phase_label = Banner(f, "", solid=True, fpx=16, weight=600)
+        self.phase_label.grid(row=1, column=0, sticky="we", pady=(S(8), 0))
+        tools = tk.Frame(f, bg=bg)
+        tools.grid(row=2, column=0, sticky="we", pady=(S(6), 0))
+        Button(tools, "Replay  F3", icon="replay", variant="ghost", size="sm",
+               command=self._replay_last, tooltip="Replay the last translation (F3)",
+               lang="en").pack(side="left")
+        self.skip_btn = Button(tools, "Skip  Esc", icon="skip", variant="ghost", size="sm",
+                               command=self._skip_voice, tooltip="Skip the voice (Esc)", lang="en")
+        self.skip_btn.pack(side="left", padx=(S(4), 0))
         self.auto_var = tk.BooleanVar(value=config.ONSITE_AUTO_ALTERNATE)
-        ttk.Checkbutton(side_col, text="Auto-switch turns",
-                        variable=self.auto_var, command=self._on_auto_alternate
-                        ).pack(side="top", anchor="w", pady=(4, 0))
-        self.phase_label = tk.Label(f, text="", font=tkfont.Font(family="Leelawadee UI", size=14),
-                                    fg="white", bg="#555555", anchor="w", padx=12, pady=8)
-        self.phase_label.pack(fill="x", pady=(6, 0))
+        Toggle(tools, self.auto_var, command=self._on_auto_alternate,
+               label="Auto-switch turns").pack(side="right")
+        tk.Label(tools, text="Auto-switch turns", bg=bg, fg=C("text_2"),
+                 font=theme.T.font(13, 500)).pack(side="right", padx=(0, S(4)))
         self._show_floor()
 
-    def _on_caption_resize(self, event):
-        w = max(200, event.width - 30)
-        self.main_label.configure(wraplength=w)
-        self.sub_label.configure(wraplength=w)
-        self.warn_label.configure(wraplength=w)
+    # ------------------------------------------------------------ page layout
+    def _on_page_resize(self, e):
+        W, H = e.width, e.height
+        narrow = W < S(640)
+        g = S(16) if narrow else S(24)
+        cw = int(min(W - 2 * g, S(720)))
+        x = (W - cw) // 2
+        nav_h = S(60)
+        card_y = g + nav_h + S(12)
+        card_h = max(S(200), H - card_y - g)
+        inset = S(5)
+        self._layout = (W, H, x, g, cw, nav_h, card_y, card_h)
+        self.page.coords(self._nav_win, x + inset, g + inset)
+        self.page.itemconfigure(self._nav_win, width=cw - 2 * inset, height=nav_h - 2 * inset)
+        self.page.coords(self._card_win, x + inset, card_y + inset)
+        self.page.itemconfigure(self._card_win, width=cw - 2 * inset, height=card_h - 2 * inset)
+        pad = S(16) if narrow else S(32)
+        self.col.pack_configure(padx=pad - inset, pady=(S(16) if narrow else S(22), S(8)))
+        # Narrow: drop the pair chip, then the app name (the logo stays).
+        self.nav_pair.pack_forget()
+        self.nav_title.pack_forget()
+        if W >= S(400):
+            self.nav_title.pack(side="left", padx=(S(10), 0))
+        if W >= S(480):
+            self.nav_pair.pack(side="left", padx=(S(10), 0))
+        if self._page_job is not None:
+            self.root.after_cancel(self._page_job)
+        self._page_job = self.root.after(40, self._paint_page)
+        self._schedule_fit()
+
+    def _schedule_fit(self):
+        if getattr(self, "_fit_job", None) is None and hasattr(self, "messages"):
+            self._fit_job = self.root.after(60, self._fit_height)
+
+    def _paint_page(self):
+        self._page_job = None
+        W, H, x, g, cw, nav_h, card_y, card_h = self._layout
+        img = paint.gradient(W, H, C("page_a"), C("page_b"))
+        r = S(theme.RADIUS_CARD)
+        from .widgets import _scaled
+        paint.drop_card(img, x, g, cw, nav_h, r, C("bg"), None, _scaled(theme.SHADOW_CARD))
+        paint.drop_card(img, x, card_y, cw, card_h, r, C("bg"), None, _scaled(theme.SHADOW_CARD))
+        self._page_photo = paint.to_photo(img)
+        self.page.itemconfigure(self._page_img, image=self._page_photo)
+
+    def _on_col_resize(self, e):
+        w = max(S(200), e.width)
+        self.subtitle.configure(wraplength=w)
+        self.status_label.configure(wraplength=w)
+        self.queue_label.configure(wraplength=w)
+        self.usage_label.configure(wraplength=w)
+        self.setting_hint.configure(wraplength=w)
+        self.options_summary.configure(wraplength=max(S(80), w - S(200)))
+
+    def _fit_height(self):
+        """Short window: when the conversation would be squeezed to nothing,
+        drop the title block (it comes back once there is room again)."""
+        self._fit_job = None
+        if getattr(self, "_compact", False) or self.card.winfo_height() <= 1:
+            return  # while live the title block is hidden anyway
+        h = self.messages.winfo_height() if self.messages.winfo_ismapped() else 0
+        head_h = self.head.winfo_reqheight() + self.setting_hint.winfo_reqheight() + S(22)
+        if not self._head_hidden and h < S(56):
+            self._head_hidden = True
+            self.head.grid_remove()
+            self.setting_hint.grid_remove()
+            self.setting_tabs.grid_configure(pady=(0, 0))
+        elif self._head_hidden and h - head_h > S(80):  # room again, with margin
+            self._head_hidden = False
+            self.setting_tabs.grid_configure(pady=(S(18), 0))
+            self.head.grid()
+            self.setting_hint.grid()
 
     # --------------------------------------------------------------- devices
     def refresh_devices(self):
@@ -293,15 +453,21 @@ class App:
             else:
                 msg = ("⚠ FEEDBACK RISK: the voice plays on the same device being captured, "
                        "so the app will hear and re-translate its own voice. Pick another output "
-                       "(e.g. headphones), tick 'Pause listening while voice speaks', or Mute voice.")
+                       "(e.g. headphones), turn on 'Pause listening while the voice speaks', "
+                       "or Mute voice.")
         elif in_dev.kind == "mic" and self.setting_var.get() == "onsite":
             msg = ("Onsite: the mic is muted while the voice speaks and for "
                    f"{config.ONSITE_TAIL_S:.1f} s after. Speech during that time is not heard; "
                    "wait for the green banner.")
         elif in_dev.kind == "mic" and not self.pause_var.get():
             msg = ("Mic mode: if the voice plays on speakers in the room, the mic will pick it "
-                   "up. Use headphones, or tick 'Pause listening while voice speaks'.")
-        self.warn_label.configure(text=msg, fg="#b00020" if "⚠" in msg else "#8a5a00")
+                   "up. Use headphones, or turn on 'Pause listening while the voice speaks'.")
+        danger = "⚠" in msg
+        if getattr(self, "_compact", False) and not danger:
+            msg = ""  # while live, only real risks stay on screen
+        self.warn_label.configure(text=msg.replace("⚠ ", ""), tone="danger" if danger else "warning")
+        self._schedule_fit()
+        self._update_options_summary()
 
     # ----------------------------------------------------------- start/stop
     @property
@@ -318,6 +484,13 @@ class App:
         sess = self.session
         return sess.latency if sess is not None else None
 
+    def _on_record(self):
+        """The big button: start when idle, stop when running."""
+        if self.state is State.IDLE:
+            self.on_start()
+        elif self.state is State.RUNNING:
+            self.on_stop()
+
     def on_start(self):
         if self.state is not State.IDLE:
             return
@@ -326,12 +499,14 @@ class App:
         if in_dev is None or out_dev is None:
             self.set_status("error", "Choose an input device and a voice output device first.")
             return
+        if in_dev.kind == "mic" and winmic.mic_blocked():
+            self._show_mic_blocked()
+            return
         if not self.sm.transition(State.STARTING):
             return
-        self.start_btn.configure(state="disabled")  # immediately: no double start
+        self._refresh_live()  # immediately: the button is disabled, no double start
         render_dev = next((d for d in self.devices.outputs if d.name == in_dev.render_name), None)
         self._set_device_widgets("disabled")
-        self.stop_btn.configure(state="normal")
         self._error_shown = False
         self.set_status("connecting", "Checking Azure key and region…")
         muted = self.mute_var.get()  # read Tk vars on the Tk thread only
@@ -341,6 +516,7 @@ class App:
         mode = self.mode_var.get()
         self._onsite_live = onsite
         self.echo = EchoFilter() if onsite else None
+        self._voice_choice = voices.chosen()
         self.session = sess = Session()
         sess.run_start(self._start_worker, in_dev, out_dev, render_dev, muted, mode, onsite)
 
@@ -355,7 +531,7 @@ class App:
 
         try:
             creds = config.load_credentials()
-            voices = config.load_voices()
+            voice_names = config.load_voices(self._voice_choice)
             config.segmentation_silence_ms()  # validate now: a bad value is a ConfigError
             config.preflight_check(creds)
             sess.check()
@@ -377,7 +553,7 @@ class App:
                 on_queue=lambda n, sk: post(self._show_queue, n, sk),
                 on_spoken_chars=self._add_chars,
                 on_error=lambda m: post(self.set_status, None, m),
-                voices=voices,
+                voices=voice_names,
                 on_playing=self._on_voice_playing,
                 tail_s=config.ONSITE_TAIL_S if onsite else config.PAUSE_TAIL_S,
                 # Conversation: read everything, in order. Meeting: stay current.
@@ -404,7 +580,7 @@ class App:
 
             sess.check()
             capture = AudioCapture(self.pa)
-            capture.start(in_dev, pump.feed, render_dev)
+            capture.start(in_dev, self._metered(pump.feed), render_dev)
             sess.own("capture", capture, lambda c: c.stop())
 
             post(self._note, f"Session started. Auto-saving to {sess.transcript.txt_path}")
@@ -421,6 +597,8 @@ class App:
         except OSError as e:
             if sess.cancelled.is_set():
                 return
+            if in_dev.kind == "mic" and winmic.mic_blocked():
+                post(self._show_mic_blocked)
             post(self._fail, sess, f"Audio device error: {e}. Try another device or Refresh devices.")
             return
         except Exception as e:
@@ -430,8 +608,26 @@ class App:
             return
         post(self._started, sess)
 
+    def _metered(self, feed):
+        """Wraps the pump's feed to keep an input level for the meter. Runs in
+        the capture callback, so it only does one cheap RMS."""
+        import numpy as np
+
+        def metered(chunk: bytes):
+            try:
+                a = np.frombuffer(chunk, dtype=np.int16)
+                if a.size:
+                    rms = float(np.sqrt(np.mean(a.astype(np.float32) ** 2)))
+                    db = 20 * np.log10(max(rms, 1.0) / 32768.0)
+                    self._level = max(0.0, min(1.0, (db + 55) / 45))
+            except Exception:
+                pass
+            feed(chunk)
+        return metered
+
     def _started(self, sess: Session):
         self.sm.transition(State.RUNNING)  # refused if Stop already happened
+        self._refresh_live()
 
     def on_stop(self):
         self._begin_stop()
@@ -441,7 +637,7 @@ class App:
         if sess is None or not self.sm.transition(State.STOPPING):
             return False  # idle, or already stopping: double Stop is a no-op
         sess.cancelled.set()
-        self.stop_btn.configure(state="disabled")
+        self._refresh_live()
         if not self._error_shown:
             self.set_status("stopping", "Stopping…")
         threading.Thread(target=self._stop_worker, args=(sess,),
@@ -463,13 +659,15 @@ class App:
             return
         self.session = None
         self._set_device_widgets("normal")
-        self.start_btn.configure(state="normal")
-        self.stop_btn.configure(state="disabled")
         if not self._error_shown:
             self.set_status("idle", "Stopped.")
         self._update_usage_label()
         self._last_delay = None
-        self.queue_label.configure(text="Voice queue: 0", fg="#000000")
+        self._playing_ids = ()
+        self.messages.clear_interim()
+        self.messages.set_playing(())
+        self.queue_label.configure(text="Voice queue: 0", fg=C("text_3"))
+        self._refresh_live()
 
     def _fail(self, sess: Session, message: str):
         """Fatal error: show it, then tear down. Never reconnects."""
@@ -488,6 +686,26 @@ class App:
             w.configure(state=state)
         if state == "normal":
             self._apply_setting()  # re-apply onsite restrictions
+            if self._options_open_before:
+                self._set_options_open(True)
+        else:
+            self._options_open_before = self.options_open
+            self._set_options_open(False)  # more room for the conversation while live
+        self._set_compact(state != "normal")
+
+    def _set_compact(self, on: bool):
+        """While live, hide what can't be changed anyway (title, setting tabs,
+        info notes) so the conversation gets the space."""
+        self._compact = on
+        for w in (self.setting_tabs,):
+            w.grid_remove() if on else w.grid()
+        for w in (self.head, self.setting_hint):
+            w.grid_remove() if on or self._head_hidden else w.grid()
+        if on and not self.usage.warnings():
+            self.usage_label.pack_forget()
+        elif not on:
+            self.usage_label.pack(fill="x", pady=(S(2), 0))
+        self._update_feedback_warning()
 
     def _apply_setting(self):
         """Onsite: mic only, mic gating always on, direction set by the floor."""
@@ -502,15 +720,60 @@ class App:
             self.mode_var.set(self.turn.mode)
             for rb in self.mode_rbs:
                 rb.configure(state="disabled")
-            self.turn_frame.pack(fill="x", before=self.cap_frame)
+            self.lang_row.grid_remove()
+            self.turn_frame.grid(row=3, column=0, sticky="we", pady=(S(10), 0))
+            self.setting_hint.configure(text="Two people, one device. Tap who is speaking; the "
+                                             "mic pauses while the translation is read out.")
         else:
             if self.state is State.IDLE:
                 self.rb_loop.configure(state="normal")
                 self.pause_cb.configure(state="normal")
                 for rb in self.mode_rbs:
                     rb.configure(state="normal")
-            self.turn_frame.pack_forget()
+            self.turn_frame.grid_remove()
+            self.lang_row.grid()
+            self.setting_hint.configure(text="Remote meeting, or listening only. Captions and "
+                                             "voice follow the speaker.")
+            self._sync_lang_row()
+        self.messages.set_two_sided(onsite or self.mode_var.get() == config.MODE_AUTO)
         self._on_pause_opt()
+
+    # ---------------------------------------------------------- language row
+    def _sync_lang_row(self):
+        """Show mode_var in the source/target pickers."""
+        mode = self.mode_var.get()
+        if mode == config.MODE_AUTO:
+            self.src_select.set(SRC_LABELS[config.MODE_AUTO])
+            self.tgt_select.set(TGT_AUTO_LABEL)
+            auto = True
+        else:
+            src, tgt = config.direction(mode)
+            self.src_select.set(SRC_LABELS[src])
+            self.tgt_select.set(config.LANGUAGES[tgt].name)
+            auto = False
+        if self.setting_var.get() != "onsite":
+            self.swap_btn.configure(state="disabled" if auto else "normal")
+            self.tgt_select.configure(state="disabled" if auto else "normal")
+        self.messages.set_two_sided(self.setting_var.get() == "onsite" or auto)
+
+    def _set_mode(self, mode: str):
+        if mode != self.mode_var.get():
+            self.mode_var.set(mode)
+            self._on_mode_change()
+
+    def _on_src_pick(self, label: str):
+        code = next(k for k, v in SRC_LABELS.items() if v == label)
+        self._set_mode(code if code == config.MODE_AUTO else f"{code}>{config.other(code)}")
+
+    def _on_tgt_pick(self, label: str):
+        code = next(c for c in config.PAIR if config.LANGUAGES[c].name == label)
+        self._set_mode(f"{config.other(code)}>{code}")
+
+    def _swap(self):
+        mode = self.mode_var.get()
+        if mode != config.MODE_AUTO:
+            src, tgt = config.direction(mode)
+            self._set_mode(f"{tgt}>{src}")
 
     # -------------------------------------------------------- live updates
     def post(self, fn, *args):
@@ -536,18 +799,16 @@ class App:
             pass
 
     def set_status(self, state: Optional[str], message: str):
-        color = STATUS_COLORS.get(state, "#8a5a00")
+        color = C(STATUS_TOKENS.get(state, "warning"))
         if state is not None and self._error_shown and state != "error":
             return  # keep the error visible until the next Start
+        if state is not None:
+            self._status_state = state
         self.status_label.configure(text=message, fg=color)
 
-    def _caption_fonts(self, src: str, tgt: str):
-        return self.f_big.get(tgt, self.f_big["en"]), self.f_sub.get(src, self.f_sub["en"])
-
     def _show_interim(self, source_text: str, translated: str, src: str, tgt: str):
-        big, sub = self._caption_fonts(src, tgt)
-        self.main_label.configure(text=translated or "…", fg="#9a9a9a", font=big)
-        self.sub_label.configure(text=source_text, fg="#9a9a9a", font=sub)
+        self._interim_at = time.monotonic()
+        self.messages.set_interim(source_text, translated, src, tgt)
 
     def _show_final(self, seg: Segment):
         shown = time.monotonic()
@@ -558,24 +819,12 @@ class App:
             if lat is not None:
                 lat.ignored(seg, "echo")
             return
-        big, sub = self._caption_fonts(seg.source_lang, seg.target_lang)
-        self.main_label.configure(text=seg.translated_text, fg="#000000", font=big)
-        self.sub_label.configure(text=seg.source_text, fg="#444444", font=sub)
+        self._interim_at = 0.0
         seg_id = len(self._segs) + 1
         self._segs[seg_id] = seg
         self._last_seg_id = seg_id
-        h = self.history
-        at_bottom = h.yview()[1] >= 0.999
-        h.configure(state="normal")
-        h.insert("end", "▶ ", ("replay", f"seg{seg_id}"))
-        h.insert("end", f"[{datetime.fromtimestamp(seg.start):%H:%M:%S}] "
-                        f"{seg.source_lang.upper()}→{seg.target_lang.upper()} ", "time")
-        h.insert("end", seg.source_text, (seg.source_lang, "src"))
-        h.insert("end", "  →  ", "arrow")
-        h.insert("end", seg.translated_text + "\n", (seg.target_lang, "tgt"))
-        h.configure(state="disabled")
-        if at_bottom:
-            h.see("end")
+        self.messages.add_message(seg_id, seg.source_text, seg.translated_text,
+                                  seg.source_lang, seg.target_lang, seg.start)
         if self.transcript:
             try:
                 self.transcript.add(seg)
@@ -593,22 +842,19 @@ class App:
                 self.turn.on_final(seg.source_lang)
 
     def _note(self, text: str):
-        self.history.configure(state="normal")
-        self.history.insert("end", text + "\n", "note")
-        self.history.configure(state="disabled")
-        self.history.see("end")
+        self.messages.add_note(text)
 
     def _show_queue(self, waiting: int, skipped: int):
         text = f"Voice queue: {waiting}"
         if skipped:
-            text += f"  (skipped {skipped} to keep up; ▶ in History replays them)"
+            text += f"  (skipped {skipped} to keep up; ▶ on a message replays it)"
         tts = self.tts
         behind = tts.behind_seconds() if tts is not None else 0.0
         warn = behind >= config.TTS_BEHIND_WARN_S
         if warn:
             text += f"  ⚠ voice is ~{behind:.0f} s behind"
         text += self._delay_text()
-        self.queue_label.configure(text=text, fg="#b00020" if warn else "#000000")
+        self.queue_label.configure(text=text, fg=C("danger_active") if warn else C("text_3"))
 
     def _delay_text(self) -> str:
         row = self._last_delay
@@ -630,6 +876,33 @@ class App:
         self._show_queue(tts.waiting if tts is not None else 0,
                          tts.skipped if tts is not None else 0)
 
+    def _live_state(self):
+        """(record-button state, mic muted) from the session state."""
+        st = self.state
+        if st is State.STARTING:
+            return "starting", False
+        if st is State.STOPPING:
+            return "stopping", False
+        if st is not State.RUNNING:
+            return ("error" if self._error_shown else "idle"), False
+        if self._status_state == "reconnecting":
+            return "reconnecting", False
+        tts = self.tts
+        tts_state = tts.state() if tts is not None else "idle"
+        gated = self._pause_while_speaking or self._onsite_live
+        if tts_state in ("speaking", "tail"):
+            return "speaking", gated
+        if tts_state == "pending" or time.monotonic() - self._interim_at < 1.2:
+            return "translating", False
+        return "listening", False
+
+    def _refresh_live(self):
+        state, muted = self._live_state()
+        self.record_btn.set_state(state, level=self._level, mic_muted=muted)
+        tts = self.tts
+        speaking = tts is not None and tts.state() == "speaking"
+        self.messages.set_playing(self._playing_ids if speaking else ())
+
     # ---------------------------------------------------------------- replay
     def _replay(self, seg_id: int) -> bool:
         seg = self._segs.get(seg_id)
@@ -645,14 +918,6 @@ class App:
         if self._last_seg_id is not None:
             self._replay(self._last_seg_id)
 
-    def _on_history_click(self, event):
-        idx = self.history.index(f"@{event.x},{event.y}")
-        for tag in self.history.tag_names(idx):
-            if tag.startswith("seg") and tag[3:].isdigit():
-                self._replay(int(tag[3:]))
-                return "break"
-        return None
-
     def _add_chars(self, n: int):
         self.usage.session_chars += n  # int += is fine across threads here
 
@@ -664,7 +929,9 @@ class App:
         return tts.is_busy()
 
     def _on_voice_playing(self, utt):
-        """TTS thread: remember what is about to be said, for the echo filter."""
+        """TTS thread: remember what is about to be said, for the echo filter
+        and the 'speaking' highlight on its message cards."""
+        self._playing_ids = tuple(getattr(utt, "seg_ids", ()) or ())
         echo = self.echo
         if echo is not None:
             echo.spoken(utt.text, utt.lang)
@@ -684,19 +951,25 @@ class App:
         if tts is not None:
             tts.skip()
 
+    def _on_escape(self, event=None):
+        top = Overlay.topmost()
+        if top is not None:
+            top.close()
+            return "break"
+        self._skip_voice()
+        return None
+
     def _on_auto_alternate(self):
         self.turn.auto_alternate = self.auto_var.get()
 
     def _show_floor(self):
-        for side, b in self.floor_btns.items():
-            on = side == self.turn.side
-            b.configure(bg="#1b7a2e" if on else "#e6e6e6", fg="white" if on else "#333333",
-                        activebackground="#22943a" if on else "#d6d6d6",
-                        relief="sunken" if on else "raised")
+        if self.floor_var.get() != self.turn.side:
+            self.floor_var.set(self.turn.side)
 
     def _onsite_tick(self):
         try:
             self._update_onsite()
+            self._refresh_live()
         finally:
             self.root.after(100, self._onsite_tick)
 
@@ -706,9 +979,7 @@ class App:
         sess = self.session
         tts, ctl = self.tts, (sess.controller if sess is not None else None)
         if self.state is not State.RUNNING or tts is None or ctl is None:
-            self.phase_label.configure(text="Press Start, then the person speaking presses "
-                                            "their button   ·   กด Start แล้วกดปุ่มของผู้พูด",
-                                       bg="#555555")
+            self.phase_label.configure(text=PHASE_IDLE, bg=C("text_2"))
             return
         tts_state = tts.state()
         mode = self.turn.poll(tts_state, ctl.is_switching)
@@ -717,14 +988,15 @@ class App:
             self.mode_var.set(mode)
             self._on_mode_change()
         phase = phase_of(tts_state, ctl.is_switching)
-        bg, text = PHASE_BANNER[phase]
+        token, text = PHASE_BANNER[phase]
         if isinstance(text, dict):
             text = text[self.turn.side]
-        self.phase_label.configure(text=text, bg=bg)
+        self.phase_label.configure(text=text, bg=C(token))
 
     def _on_mute(self):
         if self.tts:
             self.tts.set_muted(self.mute_var.get())
+        self._update_options_summary()
 
     def _on_mode_change(self):
         sess = self.session
@@ -755,15 +1027,152 @@ class App:
                 pass
         self.root.after(1000, self._tick)
 
-    def _update_usage_label(self):
+    def _usage_text(self) -> str:
         u = self.usage
-        text = (f"This session: {u.session_audio_s / 60:.1f} audio min, {u.session_chars:,} TTS chars   |   "
-                f"This month (this app): {u.month_audio_s / 3600:.2f} / {config.F0_TRANSLATION_AUDIO_HOURS} h audio, "
-                f"{u.month_chars:,} / {config.F0_NEURAL_TTS_CHARS:,} TTS chars (F0 free)")
-        warns = u.warnings()
+        return (f"This session: {u.session_audio_s / 60:.1f} audio min, {u.session_chars:,} TTS chars"
+                f"   ·   This month (this app): {u.month_audio_s / 3600:.2f} / "
+                f"{config.F0_TRANSLATION_AUDIO_HOURS} h audio, {u.month_chars:,} / "
+                f"{config.F0_NEURAL_TTS_CHARS:,} TTS chars (F0 free)")
+
+    def _update_usage_label(self):
+        text = self._usage_text()
+        warns = self.usage.warnings()
         if warns:
             text += "   ⚠ " + "; ".join(warns)
-        self.usage_label.configure(text=text, fg="#b00020" if warns else "#555555")
+        self.usage_label.configure(text=text, fg=C("danger_active") if warns else C("text_3"))
+
+    # -------------------------------------------------------- options / voice
+    def _toggle_options(self):
+        self._set_options_open(not self.options_open)
+
+    def _set_options_open(self, on: bool):
+        self.options_open = on
+        if on:
+            self.options_body.grid()
+        else:
+            self.options_body.grid_remove()
+        self.options_btn.configure(icon_right="chevron_up" if on else "chevron_down")
+        self._update_options_summary()
+        self._schedule_fit()
+
+    def _update_options_summary(self):
+        if self.options_open:
+            self.options_summary.configure(text="")
+            return
+        src = "System audio" if self.source_var.get() == "loopback" else "Microphone"
+        voice = "muted" if self.mute_var.get() else self._voice_summary()
+        self.options_summary.configure(text=f"{src} · voice: {voice}")
+
+    def _voice_summary(self) -> str:
+        try:
+            names = config.load_voices(self._voice_choice)
+        except config.ConfigError:
+            names = dict(config.DEFAULT_VOICES)
+        return " · ".join(voices.short_label(names[c]) for c in config.PAIR)
+
+    def _open_voice_picker(self):
+        try:
+            current = config.load_voices(self._voice_choice)
+        except config.ConfigError:
+            current = dict(config.DEFAULT_VOICES)
+        out_dev = self._selected(self.out_combo, self.devices.outputs)
+        previewer = None
+        if out_dev is not None:
+            previewer = voices.Previewer(
+                lambda: Player(self.pa, out_dev),
+                lambda name, err: self.post(self._preview_state, name, err))
+        self._picker = VoicePicker(self.root, current, self._choose_voice, previewer=previewer,
+                                   running=self.state is not State.IDLE, post=self.post)
+
+    def _preview_state(self, name, err):
+        if self._picker is not None:
+            self._picker.preview_state(name, err)
+
+    def _choose_voice(self, lang: str, name: str):
+        voices.save_choice(lang, name)
+        self._voice_choice = voices.chosen()
+        self.voice_btn.configure(text=self._voice_summary())
+        self._update_options_summary()
+
+    # --------------------------------------------------- navbar / modals
+    def _toggle_large(self):
+        on = not self.large_var.get()
+        self.large_var.set(on)
+        self.large_btn.set_toggled(on)
+        self.messages.set_large(on)
+        data = voices.load_settings()
+        data["large_text"] = on
+        voices.save_settings(data)
+
+    def _export_menu(self):
+        items = ["Transcript (.txt)", "Subtitles (.srt)"]
+        Popover(self.export_btn, items, None,
+                lambda item: self.export(".srt" if "srt" in item else ".txt"), width=200)
+
+    def _open_settings(self):
+        def build(body):
+            bg = body.cget("bg")
+
+            def section(title):
+                tk.Label(body, text=title, bg=bg, fg=C("text"), font=theme.T.font(15, 600),
+                         anchor="w").pack(fill="x", pady=(S(8), S(4)))
+
+            def line(text, fg="text_2"):
+                tk.Label(body, text=text, bg=bg, fg=C(fg), font=theme.T.font(13),
+                         anchor="w", justify="left", wraplength=S(440)).pack(fill="x")
+            section("Keyboard shortcuts")
+            for keys, what in (("F1 / F2", "Onsite: give the floor to the English / Thai speaker"),
+                               ("F3", "Replay the last translation"),
+                               ("Esc", "Skip the voice, or close a dialog"),
+                               ("Tab, Space", "Move between controls and press them")):
+                row = tk.Frame(body, bg=bg)
+                row.pack(fill="x", pady=S(1))
+                tk.Label(row, text=keys, bg=C("bg_subtle"), fg=C("text"), font=theme.T.font(12, 600),
+                         padx=S(8), pady=S(1), width=10).pack(side="left")
+                tk.Label(row, text=what, bg=bg, fg=C("text_2"), font=theme.T.font(13),
+                         anchor="w").pack(side="left", padx=(S(8), 0))
+            section("Usage (Azure free tier)")
+            line(self._usage_text())
+            warns = self.usage.warnings()
+            if warns:
+                line("⚠ " + "; ".join(warns), "danger_active")
+            section("Appearance")
+            line("Light or dark follows your Windows app mode. Animations follow Windows "
+                 "'Animation effects'. Large text: the Aa button in the top bar.")
+            section("Files")
+            line(f"Transcripts, logs and settings are kept in {config.APP_DIR}.")
+        Modal(self.root, "Settings", build, width=540)
+
+    def _show_mic_blocked(self):
+        def build(body):
+            bg = body.cget("bg")
+            ic = tk.Canvas(body, width=S(56), height=S(56), bg=bg, highlightthickness=0)
+            ic.pack(anchor="w")
+            ic.create_image(S(28), S(28), image=paint.circle(S(56), C("danger_10"), bg))
+            ic.create_text(S(28), S(28), text=theme.T.icon("mic_off"), font=theme.T.icon_font(22),
+                           fill=C("danger_active"))
+            steps = ("Open Windows Settings → Privacy & security → Microphone.",
+                     "Turn on “Microphone access”.",
+                     "Turn on “Let desktop apps access your microphone”.",
+                     "Come back here and press the mic again.")
+            for i, s in enumerate(steps, 1):
+                row = tk.Frame(body, bg=bg)
+                row.pack(fill="x", pady=(S(8) if i == 1 else S(4), 0))
+                tk.Label(row, text=str(i), bg=C("primary_10"), fg=C("primary"),
+                         font=theme.T.font(12, 700), width=2).pack(side="left", anchor="n")
+                tk.Label(row, text=s, bg=bg, fg=C("text"), font=theme.T.font(14), anchor="w",
+                         justify="left", wraplength=S(380)).pack(side="left", padx=(S(10), 0))
+            btns = tk.Frame(body, bg=bg)
+            btns.pack(fill="x", pady=(S(18), 0))
+            Button(btns, "Open microphone settings", icon="settings", variant="primary",
+                   command=winmic.open_settings).pack(side="left")
+            Button(btns, "Use system audio instead", variant="secondary",
+                   command=lambda: (self.source_var.set("loopback"), self._on_source_change(),
+                                    Overlay.topmost() and Overlay.topmost().close())
+                   ).pack(side="left", padx=(S(8), 0))
+        Modal(self.root, "Microphone access is off", build, width=520,
+              subtitle="Windows is blocking desktop apps from using the microphone, so the "
+                       "translator would hear only silence.")
 
     # ------------------------------------------------------------- export
     def export(self, suffix: str):
@@ -816,6 +1225,8 @@ def run():
         ctypes.windll.shcore.SetProcessDpiAwareness(1)  # crisp text on high-DPI screens
     except Exception:
         pass
+    theme.register_fonts()  # before Tk enumerates fonts
     root = tk.Tk()
+    theme.init(root)
     App(root)
     root.mainloop()

@@ -100,6 +100,11 @@ TTS_VOICE_TH=th-TH-NiwatNeural
 A voice must belong to its language (`en-…` for English, `th-…` for Thai), or
 be a `…Multilingual…` voice. Otherwise Start reports a configuration error.
 
+Easier: choose voices in the app (**Audio and voice → Select a voice**). The
+picker lists the English and Thai neural voices for your region, with a ▶
+preview. The choice is saved in `settings.json` next to the app and takes
+precedence over `TTS_VOICE_*`.
+
 ## 3. Run
 
 ```powershell
@@ -107,27 +112,64 @@ be a `…Multilingual…` voice. Otherwise Start reports a configuration error.
 python main.py
 ```
 
-1. **Listen to:** pick *System audio* (Teams/Zoom/Meet on this PC) or
-   *Microphone* (people speaking in the room).
-2. **Input device:** for system audio, pick the `[Loopback]` entry of the
-   device the meeting plays on.
-3. **Voice output:** pick where the voice should play, ideally headphones.
-4. **Direction:** *English → Thai*, *Thai → English*, or *Auto-detect
-   English/Thai (experimental)*. You can change it while running. The
-   recognizer reconnects, so speech during the switch (about a second) is
-   missed.
-5. Press **Start**. The status line shows *Checking Azure key and region…*,
-   then *Listening (English → Thai)*.
+1. **Meeting / Onsite** (the pill switch at the top): *Meeting* for remote
+   meetings or listening only; *Onsite* for two people sharing this device
+   (section 4b).
+2. **Languages:** the left pill is the spoken language (*English*, *Thai* or
+   *Auto-detect (beta)*), the right pill the language it is translated into;
+   ⇄ swaps them. You can change them while running. The recognizer
+   reconnects, so speech during the switch (about a second) is missed.
+3. **Audio and voice** (click to expand; it folds away while translating to
+   leave room for the conversation):
+   - **Listen to:** *System audio* (Teams/Zoom/Meet on this PC) or
+     *Microphone* (people speaking in the room).
+   - **Input device:** for system audio, pick the `[Loopback]` entry of the
+     device the meeting plays on. **Voice output:** where the voice should
+     play, ideally headphones. ↻ refreshes the device lists.
+   - **Mute voice**, **Pause listening while the voice speaks**, and
+     **Select a voice**.
+4. Press the round red **mic button**. The hint above it shows the state:
+   *Connecting…* (spinner, button disabled so it can't start twice), then
+   *Listening · tap to stop* with a ring that follows the input level,
+   *Translating…*, and *Speaking the translation* (blue button with a
+   speaker). When the mic is paused during the voice, a crossed-out mic badge
+   says so. Press the button again to stop.
 
-The big line in the caption area is the translation. The smaller line below
-it is what was said. Grey text is the live (interim) guess. It turns black
-when the sentence is final, and the final sentence is added to the history
-and spoken in the voice for its target language.
+The conversation shows one card per sentence: what was said (small, grey),
+the translation (large), a language badge such as **EN → TH**, the time, and
+a ▶ replay button. The sentence being heard right now appears as a **Live**
+card. The card being read aloud is highlighted. In *Auto-detect* and
+*Onsite*, the two languages sit on opposite sides (English left in blue,
+Thai right in green). The list follows the newest card; scroll up and it
+stays put, with a **Jump to latest** button. Right-click a card to copy it.
+
+Top bar: **Aa** large text (for showing the screen to the other person),
+**⤓** export, **⚙** shortcuts and usage. Light or dark follows your Windows
+app mode, and animations are off when Windows *Animation effects* is off.
+
+If Windows blocks desktop apps from the microphone (Settings → Privacy &
+security → Microphone), the app says so and links to the setting, instead
+of starting and hearing only silence.
 
 **Auto-detect** asks Azure to decide per sentence whether English or Thai was
 spoken (continuous language identification). Accuracy and delay have not
 been measured with real speech yet. Use a fixed direction for anything
 important until they have.
+
+### Running as an .exe (no Python needed)
+
+Build it once on a PC with the project set up:
+
+```powershell
+.venv\Scripts\python -m pip install pyinstaller
+powershell -ExecutionPolicy Bypass -File build_exe.ps1
+```
+
+This creates `dist\ThaiMeetingTranslator.exe`, a single file of about
+30 MB. Copy it to any folder, and put your `.env` in the **same folder**. The
+app keeps `transcripts\`, `logs\` and `usage.json` there too. It takes a few
+seconds to start, because it unpacks itself first. Windows SmartScreen may
+warn about an unsigned app: choose *More info → Run anyway*.
 
 ## 4. Recommended audio setup (Teams / Zoom / Meet)
 
@@ -149,29 +191,28 @@ headphones.
 
 **Only one output device?** Do one of these:
 
-- Tick **Mute voice** and just read the captions. This also saves TTS characters.
-- Tick **Pause listening while voice speaks**. The app sends silence to Azure
+- Turn on **Mute voice** and just read the captions. This also saves TTS characters.
+- Turn on **Pause listening while the voice speaks**. The app sends silence to Azure
   while the Thai voice plays (plus 0.4 s of echo tail). English spoken during
   that time is **missed**.
 
 The app shows a red warning when the voice output and the captured loopback
 device are the same.
 
-**Microphone mode (in-room):** play the Thai voice on headphones, or tick
-*Pause listening while voice speaks*. Otherwise the mic picks up the Thai
+**Microphone mode (in-room):** play the Thai voice on headphones, or turn on
+*Pause listening while the voice speaks*. Otherwise the mic picks up the Thai
 voice. Also keep your microphone **muted in Teams/Zoom** if the Thai voice
 plays on speakers, or the other participants will hear it.
 
 ## 4b. Onsite conversation (two people, one device)
 
-Choose **Setting: Onsite conversation**. The app then uses the microphone,
+Choose **Onsite** in the pill switch. The app then uses the microphone,
 always mutes it while the voice speaks, and lets one side talk at a time.
 
-- **Whose turn:** the big buttons **English speaker [F1]** and
-  **ผู้พูดภาษาไทย [F2]** give the floor to that person. Only their language is
-  recognized and translated (English speaker → Thai voice, Thai speaker →
-  English voice). The Direction row follows the floor and can't be set by
-  hand.
+- **Whose turn:** the switch **English · อังกฤษ [F1]** / **ไทย · Thai [F2]**
+  gives the floor to that person. Only their language is recognized and
+  translated (English speaker → Thai voice, Thai speaker → English voice).
+  The language pills are replaced by this switch.
 - **Auto-switch turns** (on by default): once the translation has been read
   out, the floor passes to the other person. Press your own button again to
   keep talking.
@@ -182,7 +223,7 @@ always mutes it while the voice speaks, and lets one side talk at a time.
   (`ONSITE_TAIL_S`), the microphone is replaced with silence. A sentence that
   still matches something the voice just said is ignored as the app hearing
   itself, and noted in the history.
-- **Skip voice [Esc]** cuts off the sentence being read; the next one, if
+- **Skip [Esc]** cuts off the sentence being read; the next one, if
   any, still plays. **Replay [F3]** reads the last translation again (see
   *Replay* below).
 
@@ -197,7 +238,7 @@ nothing is lost, but the first translation of a turn comes a little later.
 - Each finished sentence is saved immediately to
   `transcripts/meeting_YYYYMMDD_HHMMSS.txt` and `.srt`, so a crash doesn't
   lose the meeting.
-- **Export .txt / Export .srt** saves a copy wherever you choose.
+- **⤓ Export** (top bar) saves a `.txt` or `.srt` copy wherever you choose.
 - Files are UTF-8 **with BOM** and CRLF line endings, so Thai shows correctly
   in Notepad, Word, Excel and video players.
 - Each `.txt` entry is marked `EN -> TH` or `TH -> EN`. Each SRT cue has the
@@ -234,8 +275,8 @@ looks exactly like a network failure in the SDK.
 
 Sentences are read one at a time and never overlap.
 
-**Replay:** click **▶** at the start of any line in History to hear that
-translation again, or press **Replay last [F3]**. A replay plays right after
+**Replay:** click **▶** on any message card to hear that translation again,
+or press **F3** for the last one. A replay plays right after
 the sentence currently being read (it doesn't cut it off), ahead of anything
 waiting. It is never skipped or merged, and plays even with *Mute voice* on,
 because you asked for it. The last 50 spoken translations are kept in
@@ -258,13 +299,30 @@ Manual checks:
 - [ ] Mic mode: speak English. A Thai caption appears and NiwatNeural speaks it.
 - [ ] Switch to Thai → English and speak Thai. An English caption appears and JennyNeural speaks it.
 - [ ] Press Stop while the voice is speaking. It stops at once and nothing more plays.
-- [ ] Onsite, laptop speakers (no headphones): have a two-way conversation for 5 minutes. The app never translates its own voice, and no sentence spoken while the banner was green is missing from the history.
-- [ ] Click ▶ on an earlier History line: that translation is read again, after the current one.
+- [ ] Onsite, laptop speakers (no headphones): have a two-way conversation for 5 minutes. The app never translates its own voice, and no sentence spoken while the banner was green is missing from the conversation.
+- [ ] Click ▶ on an earlier message card: that translation is read again, after the current one, and the card is highlighted while it plays.
 - [ ] Onsite: finish a sentence and press the other side's button immediately. The last sentence is still translated, and the other person's first words are too.
-- [ ] Loopback mode with the voice on headphones: play an English video. It translates, and the Thai voice is not translated again (no Thai-sounding English nonsense in the history).
+- [ ] Loopback mode with the voice on headphones: play an English video. It translates, and the Thai voice is not translated again (no Thai-sounding English nonsense in the conversation).
+- [ ] UI states (see *Interface states* below): idle, connecting, listening, speaking with the muted-mic badge, the voice picker, and the microphone-blocked dialog.
 - [ ] Run for 15 minutes: no "Reconnecting" without a real network drop, and the voice queue stays at 0–2.
 - [ ] Open the exported `.txt` in Notepad and the `.srt` in VLC or Notepad. The Thai text shows correctly.
 - [ ] `python -m tools.measure --source speaker` and `--source human` (auto), then `--mode floor`: read `summary.md` (section 8).
+
+### Interface states
+
+Screenshots of each state are in [`docs/screenshots/`](docs/screenshots/)
+(desktop, 768 px, 375 px and dark). To see each state without a key or a
+meeting:
+
+| State | How to get there |
+|---|---|
+| Idle | Start the app. Red mic button, *Tap the mic to start translating* bubble gently pulsing. |
+| Connecting | Press the mic. Spinner around a dimmed button; clicks are ignored until it is up. |
+| Error | Press the mic without a `.env`. Red bubble *Couldn't start* and the reason below the button. |
+| Listening / translating | With a key: speak. The ring grows with your voice; the **Live** card shows the partial translation. |
+| Speaking | The button turns blue with a speaker. With *Pause listening while the voice speaks* on (always on in Onsite), a crossed-out mic badge shows the mic is paused. |
+| Voice picker | Audio and voice → **Select a voice**. Search, *All / Female / Male*, English and Thai tabs with counts, ▶ preview. Esc, ×, or a click outside closes it. |
+| Microphone blocked | Windows Settings → Privacy & security → Microphone → turn off *Let desktop apps access your microphone*, choose **Microphone**, press the mic. |
 
 ## 8. Measuring accuracy and latency
 
@@ -352,11 +410,19 @@ translator/tts.py       TTS queue (voice per language, queue policies, replay + 
 translator/latency.py   per-stage latency: stream clock, per-sentence log, stage tables
 translator/transcript.py   auto-save and .txt/.srt export
 translator/usage.py     session and monthly usage counter
-translator/ui.py        Tkinter window
+translator/ui.py        the window: wires the components to the session logic
+translator/theme.py     design tokens (colours, radii, shadows, motion, fonts), light/dark
+translator/widgets.py   Button, IconButton, PillTabs, PillSelect, Toggle, Modal, RecordButton, ...
+translator/messages.py  conversation list (message cards, live card, jump to latest)
+translator/voice_picker.py  voice picker dialog
+translator/voices.py    Azure voice list (cached), saved voice choice, preview
+translator/winmic.py    Windows microphone privacy check
+translator/paint.py     anti-aliased shapes for the canvas (Pillow)
+translator/assets/fonts Plus Jakarta Sans + Noto Sans Thai (SIL Open Font License)
 tools/measure.py        detection accuracy + latency measurement with real Azure/mic/speaker
 tools/phrases.tsv       test phrases for it
 tools/latency_report.py summary of the app's logs/latency-*.jsonl
-tests/                  unit tests (core, lifecycle, bidirectional, onsite, queue/replay, latency, measure)
+tests/                  unit tests (core, lifecycle, bidirectional, onsite, queue/replay, latency, measure, UI components)
 ```
 
 ## License

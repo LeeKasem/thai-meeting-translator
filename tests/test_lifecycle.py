@@ -256,6 +256,8 @@ class Fakes:
             mock.patch.object(ui.config, "preflight_check", side_effect=preflight),
             mock.patch.object(ui.config, "load_voices", return_value=dict(ui.config.DEFAULT_VOICES)),
             mock.patch.object(ui.config, "LOG_DIR", Path(self.log_dir.name)),
+            mock.patch.object(ui.winmic, "mic_blocked", return_value=False),
+            mock.patch.object(ui.voices, "chosen", return_value={}),
         ]
 
     def __enter__(self):
@@ -295,10 +297,12 @@ class Var:
 
 
 def headless_app(setting="meeting"):
+    if ui.theme.T is None:
+        ui.theme.init(None)  # colour tokens only; no Tk root needed
     app = ui.App.__new__(ui.App)
     app.pa = object()
     app.usage = SimpleNamespace(new_session=lambda: None, save=lambda: None,
-                                session_audio_s=0.0, session_chars=0)
+                                session_audio_s=0.0, session_chars=0, warnings=lambda: [])
     app._ui_q = ui.queue.Queue()
     app.sm = StateMachine()
     app._error_shown = False
@@ -310,27 +314,36 @@ def headless_app(setting="meeting"):
     app.devices = SimpleNamespace(outputs=[dev], mics=[dev], loopbacks=[])
     app._input_choices = lambda: [dev]
     app._selected = lambda combo, devs: dev
-    for w in ("start_btn", "stop_btn", "in_combo", "out_combo", "rb_loop", "rb_mic",
-              "refresh_btn", "status_label", "queue_label", "main_label", "sub_label",
-              "history", "usage_label", "rb_meeting", "rb_onsite", "pause_cb", "turn_frame",
-              "cap_frame", "phase_label", "skip_btn"):
+    for w in ("record_btn", "in_combo", "out_combo", "rb_loop", "rb_mic", "refresh_btn",
+              "status_label", "queue_label", "messages", "usage_label", "rb_meeting", "rb_onsite",
+              "pause_cb", "turn_frame", "lang_row", "phase_label", "skip_btn", "head",
+              "setting_tabs", "setting_hint", "options_body", "options_btn", "options_summary",
+              "src_select", "tgt_select", "swap_btn", "voice_btn", "warn_label", "card"):
         setattr(app, w, mock.MagicMock())
-    app.floor_btns = {"en": mock.MagicMock(), "th": mock.MagicMock()}
     app.mode_rbs = []
+    app.options_open = True
+    app._options_open_before = True
+    app._compact = False
+    app._head_hidden = False
+    app._fit_job = None
+    app._schedule_fit = lambda: None
+    app._voice_choice = {}
+    app._level = 0.0
+    app._playing_ids = ()
+    app._status_state = "idle"
+    app._interim_at = 0.0
     app.setting_var = Var(setting)
     app.source_var = Var("mic")
     app.pause_var = Var(False)
     app.auto_var = Var(ui.config.ONSITE_AUTO_ALTERNATE)
     app.turn = ui.TurnTaker()
+    app.floor_var = Var(app.turn.side)
     app.echo = None
     app._onsite_live = False
     app._segs = {}
     app._last_seg_id = None
     app._on_source_change = lambda: None
     app._update_feedback_warning = lambda: None
-    app.history.yview.return_value = (0.0, 1.0)
-    app.f_big = {"en": "big-en", "th": "big-th"}
-    app.f_sub = {"en": "sub-en", "th": "sub-th"}
     app.mute_var = SimpleNamespace(get=lambda: False)
     app.mode_var = Var(ui.config.DEFAULT_MODE)
     app.statuses = []

@@ -394,7 +394,7 @@ class OnsiteAppTest(unittest.TestCase):
             app._update_onsite()
             self.assertEqual(ctl.modes, [])
             app.phase_label.configure.assert_called_with(
-                text=ui_banner(Phase.SPEAKING, "en"), bg="#b00020")
+                text=ui_banner(Phase.SPEAKING, "en"), bg=phase_color(Phase.SPEAKING))
             tts.tts_state = "idle"
             app._update_onsite()
             self.assertEqual(ctl.modes, [config.MODE_TH_EN])
@@ -405,6 +405,11 @@ class OnsiteAppTest(unittest.TestCase):
             app = self.start(f)
             app._skip_voice()
             self.assertEqual(f.ttss[0].skips, 1)
+
+
+def phase_color(phase):
+    from translator.ui import phase_color as color
+    return color(phase)
 
 
 def ui_banner(phase, side):

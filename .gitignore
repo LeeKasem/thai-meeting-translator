@@ -6,9 +6,14 @@ transcripts/
 logs/
 results/
 usage.json
+settings.json
+voices-cache.json
 *.tmp
 
 # Python
 .venv/
 __pycache__/
 *.pyc
+build/
+dist/
+*.spec

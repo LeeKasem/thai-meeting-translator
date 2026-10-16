@@ -246,41 +246,57 @@ class AppReplayTest(unittest.TestCase):
             app._show_queue(4, 0)
             kw = app.queue_label.configure.call_args.kwargs
             self.assertIn("behind", kw["text"])
-            self.assertEqual(kw["fg"], "#b00020")
+            from translator.widgets import C
+            self.assertEqual(kw["fg"], C("danger_active"))
 
 
-class HistoryClickTest(unittest.TestCase):
-    """Real Tk text widget: clicking ▶ on a history line replays that line."""
+class MessageReplayClickTest(unittest.TestCase):
+    """Real Tk canvas: clicking ▶ on a message card replays that message."""
 
-    def test_click_replays_that_line(self):
+    def test_click_replays_that_message(self):
         try:
             root = tk.Tk()
         except tk.TclError as e:
             self.skipTest(f"no display: {e}")
         self.addCleanup(root.destroy)
+        from translator import paint, theme
+        from translator.messages import MessageList
+        theme.init(root)
+        # Runs before root.destroy: drop Tk images/fonts while Tk is alive, on
+        # this thread (otherwise Tcl aborts at exit: "deleted by the wrong thread").
+        self.addCleanup(lambda: (paint._photos.clear(), theme.init(None)))
         with Fakes() as f:
             app = headless_app()
             app.on_start()
             self.assertTrue(run_ui_until(app, lambda: app.state is State.RUNNING))
-            app.history = tk.Text(root, width=60, height=6)
-            app.history.pack()
-            app.history.tag_bind("replay", "<Button-1>", app._on_history_click)
+            frame = tk.Frame(root, bg="#FFFFFF")
+            frame.pack(fill="both", expand=True)
+            app.messages = MessageList(frame, on_replay=app._replay)
+            app.messages.pack(fill="both", expand=True)
+            root.geometry("600x500")
+            root.update()
             app._show_final(Segment(0, 1, "Hello", "สวัสดี", "en", "th"))
             app._show_final(Segment(0, 1, "ขอบคุณ", "Thank you", "th", "en"))
             root.update()
-            x, y, w, h = app.history.bbox("2.0")  # the ▶ of line 2
-            cx, cy = x + w // 2, y + h // 2
-            # The handler maps a point to that line's segment.
-            app._on_history_click(SimpleNamespace(x=cx, y=cy))
-            # And the tag binding fires (Tk tracks the tag under the mouse via Motion).
-            app.history.event_generate("<Motion>", x=cx, y=cy)
-            app.history.event_generate("<Button-1>", x=cx, y=cy)
+            cv = app.messages.cv
+            x0, y0, x1, y1 = app.messages.replay_bbox(2)  # the ▶ of message 2
+            cx, cy = (x0 + x1) // 2, (y0 + y1) // 2 - int(cv.canvasy(0))
+            # Tk tracks the item under the mouse via Motion, then the click fires.
+            cv.event_generate("<Motion>", x=cx, y=cy)
+            cv.event_generate("<Button-1>", x=cx, y=cy)
             root.update()
-            self.assertEqual(f.ttss[0].replays, [("Thank you", "en", 2)] * 2)
-            # Clicking the text itself (not ▶) doesn't replay.
-            x2, y2, w2, h2 = app.history.bbox("2.10")
-            app._on_history_click(SimpleNamespace(x=x2 + 1, y=y2 + h2 // 2))
-            self.assertEqual(len(f.ttss[0].replays), 2)
+            self.assertEqual(f.ttss[0].replays, [("Thank you", "en", 2)])
+            # Clicking the card text (not ▶) doesn't replay.
+            tx = x0 - 200
+            cv.event_generate("<Motion>", x=tx, y=cy)
+            cv.event_generate("<Button-1>", x=tx, y=cy)
+            root.update()
+            self.assertEqual(len(f.ttss[0].replays), 1)
+            # The playing message gets highlighted, and the highlight clears.
+            app.messages.set_playing((2,))
+            self.assertEqual(app.messages.playing, {2})
+            app.messages.set_playing(())
+            self.assertEqual(app.messages.playing, set())
             app.on_stop()
             run_ui_until(app, lambda: app.state is State.IDLE)
 

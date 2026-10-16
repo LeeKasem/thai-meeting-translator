@@ -1,11 +1,12 @@
 """Settings and Azure credentials.
 
 The key and region come from environment variables or a .env file next to
-main.py. They are never written anywhere by this app.
+main.py (or next to the .exe). They are never written anywhere by this app.
 """
 import os
 import re
 import socket
+import sys
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -13,7 +14,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-APP_DIR = Path(__file__).resolve().parent.parent
+if getattr(sys, "frozen", False):
+    # Packaged .exe: the code is unpacked to a temp folder, so keep .env,
+    # transcripts, logs and usage.json next to the .exe instead.
+    APP_DIR = Path(sys.executable).resolve().parent
+else:
+    APP_DIR = Path(__file__).resolve().parent.parent
 TRANSCRIPT_DIR = APP_DIR / "transcripts"
 USAGE_FILE = APP_DIR / "usage.json"
 LOG_DIR = APP_DIR / "logs"  # per-session latency logs (latency-*.jsonl)
@@ -168,8 +174,9 @@ def load_credentials() -> Credentials:
     return Credentials(key, region)
 
 
-def load_voices() -> dict:
-    """Voice name per language: DEFAULT_VOICES overridden by TTS_VOICE_<CODE>.
+def load_voices(chosen: dict = None) -> dict:
+    """Voice name per language: DEFAULT_VOICES overridden by TTS_VOICE_<CODE>,
+    overridden by `chosen` (the voices picked in the app, see voices.py).
 
     A voice must belong to its language's locale family (th-* for Thai) unless
     it is a Multilingual voice, so a typo can't make English text be read by
@@ -177,7 +184,8 @@ def load_voices() -> dict:
     load_dotenv(APP_DIR / ".env")
     voices = {}
     for code in PAIR:
-        name = os.environ.get(f"TTS_VOICE_{code.upper()}", "").strip() or DEFAULT_VOICES[code]
+        name = ((chosen or {}).get(code) or os.environ.get(f"TTS_VOICE_{code.upper()}", "").strip()
+                or DEFAULT_VOICES[code])
         if not re.fullmatch(r"[a-z]{2,3}-[A-Za-z]{2,4}(-[A-Za-z]+)?-[A-Za-z0-9]+", name):
             raise ConfigError(f"TTS_VOICE_{code.upper()}='{name}' doesn't look like an Azure "
                               "voice name, e.g. 'en-US-JennyNeural'.")

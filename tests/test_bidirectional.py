@@ -286,7 +286,7 @@ class AppDirectionTest(unittest.TestCase):
             app._show_final(Segment(0, 1, "ขอบคุณ", "Thank you", "th", "en"))
             app._show_final(Segment(0, 1, "Hello", "สวัสดี", "en", "th"))
             self.assertEqual(f.ttss[0].enqueued, [("Thank you", "en"), ("สวัสดี", "th")])
-            app.main_label.configure.assert_called_with(text="สวัสดี", fg="#000000", font="big-th")
+            app.messages.add_message.assert_called_with(2, "Hello", "สวัสดี", "en", "th", 0)
             app.on_stop()
             run_ui_until(app, lambda: app.state is State.IDLE)
 
