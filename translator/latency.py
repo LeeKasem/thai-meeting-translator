@@ -111,10 +111,14 @@ class LatencyLog:
     worker; a row is emitted when both halves are in (or at close())."""
 
     def __init__(self, path: Optional[Path] = None, include_text: bool = False,
-                 on_row: Optional[Callable[[dict], None]] = None):
+                 on_row: Optional[Callable[[dict], None]] = None,
+                 keep_rows: Optional[int] = None):
         self.path = path
         self.include_text = include_text
         self.on_row = on_row
+        # In memory: all rows (measurement runs) or the last `keep_rows` (the
+        # app, so hours-long sessions stay bounded; the file has them all).
+        self.keep_rows = keep_rows
         self.rows: List[dict] = []
         self._open: Dict[int, dict] = {}
         self._lock = threading.Lock()
@@ -211,6 +215,8 @@ class LatencyLog:
         rec.update(stages(t))
         rec["t"] = {k: (round(v, 4) if isinstance(v, float) else v) for k, v in t.items()}
         self.rows.append(rec)
+        if self.keep_rows is not None and len(self.rows) > self.keep_rows:
+            del self.rows[: len(self.rows) - self.keep_rows]
         if self._fh is not None:
             try:
                 self._fh.write(json.dumps(rec, ensure_ascii=False) + "\n")

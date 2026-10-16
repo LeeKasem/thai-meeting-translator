@@ -166,15 +166,16 @@ class ReconnectLogicTest(unittest.TestCase):
         c._on_canceled(1, _canceled(speechsdk.CancellationErrorCode.AuthenticationFailure))
         self.assertEqual(ev["fatal"], [])
 
-    def test_retries_are_capped(self):
+    def test_retries_can_be_capped(self):
         c, ev = self.make()
         c._on_connected(1)
-        with unittest.mock.patch.object(config, "RECONNECT_BACKOFF_S", (0.01,)):
-            for _ in range(config.MAX_RECONNECT_ATTEMPTS + 1):
+        with unittest.mock.patch.object(config, "RECONNECT_BACKOFF_S", (0.01,)), \
+                unittest.mock.patch.object(config, "MAX_RECONNECT_ATTEMPTS", 5):
+            for _ in range(5 + 1):
                 g = c._gen
                 c._on_canceled(g, _canceled(speechsdk.CancellationErrorCode.ServiceTimeout))
                 time.sleep(0.1)
-        self.assertEqual(ev["opens"], config.MAX_RECONNECT_ATTEMPTS)
+        self.assertEqual(ev["opens"], 5)
         self.assertEqual(len(ev["fatal"]), 1)
         self.assertIn("Gave up", ev["fatal"][0])
 

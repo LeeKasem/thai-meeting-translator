@@ -23,6 +23,7 @@ from .messages import MessageList
 from .onsite import EchoFilter, Phase, TurnTaker, phase_of
 from .recognition import RecognitionController, Segment
 from .session import Cancelled, Session, State, StateMachine
+from .subtitle_view import SubtitleView
 from .transcript import Transcript
 from .tts import POLICY_CATCH_UP, POLICY_IN_ORDER, TtsQueue
 from .usage import Usage
@@ -35,17 +36,23 @@ STATUS_TOKENS = {"idle": "text_2", "connecting": "primary", "listening": "succes
                  "reconnecting": "warning", "error": "danger_active", "stopping": "text_2"}
 
 SIDE_LABEL = {"en": "English speaker · ผู้พูดอังกฤษ", "th": "ผู้พูดภาษาไทย · Thai speaker"}
-FLOOR_TABS = (("en", "English · อังกฤษ", "mic"), ("th", "ไทย · Thai", "mic"))
+# Onsite floor: Auto (detected language decides; mic open for both) or a
+# locked side. "auto" is the Tk-variable value for TurnTaker.side None.
+FLOOR_TABS = (("auto", "Auto · อัตโนมัติ", "people"), ("en", "English · อังกฤษ", "mic"),
+              ("th", "ไทย · Thai", "mic"))
 # Onsite banner per phase: (colour token, text). Bilingual: both people read it.
 PHASE_BANNER = {
     Phase.LISTENING: ("success", {"en": "English speaker: please speak   ·   ผู้พูดภาษาอังกฤษ พูดได้เลย",
-                                  "th": "ผู้พูดภาษาไทย พูดได้เลย   ·   Thai speaker: please speak"}),
+                                  "th": "ผู้พูดภาษาไทย พูดได้เลย   ·   Thai speaker: please speak",
+                                  "auto": "Speak English or Thai   ·   พูดภาษาไทยหรือภาษาอังกฤษได้เลย"}),
     Phase.SWITCHING: ("primary", "Switching turn… you can start speaking   ·   กำลังสลับผู้พูด… เริ่มพูดได้"),
     Phase.TRANSLATING: ("warning", "Translating   ·   กำลังแปล"),
     Phase.SPEAKING: ("danger_active", "Reading the translation: please wait   ·   กำลังอ่านคำแปล กรุณารอ"),
     Phase.TAIL: ("danger_active", "Reading the translation: please wait   ·   กำลังอ่านคำแปล กรุณารอ"),
 }
-PHASE_IDLE = "Press the mic, then the person speaking taps their side   ·   กดไมค์ แล้วกดฝั่งของผู้พูด"
+PHASE_IDLE = "Press the mic, then just talk: the language is detected   ·   กดไมค์ แล้วพูดได้เลย"
+# Latency rows kept in memory per session (the log file has them all).
+LATENCY_ROWS_KEPT = 500
 
 
 def phase_color(phase: Phase) -> str:
@@ -87,6 +94,7 @@ class App:
         self._interim_at = 0.0
         self._voice_choice = voices.chosen()
         self._picker: Optional[VoicePicker] = None
+        self.subtitle_view: Optional[SubtitleView] = None
         self._options_open_before = True
 
         self._build()
@@ -101,6 +109,9 @@ class App:
         root.bind_all("<F2>", lambda e: self._give_floor("th"))
         root.bind_all("<Escape>", self._on_escape)
         root.bind_all("<F3>", lambda e: self._replay_last())
+        root.bind_all("<F4>", lambda e: self._give_floor("auto"))
+        root.bind_all("<Control-m>", lambda e: self._toggle_mute())
+        root.bind_all("<F11>", lambda e: self._open_subtitles())
 
     # ---------------------------------------------------------------- layout
     def _build(self):
@@ -153,7 +164,9 @@ class App:
                                      command=self._export_menu, size=38)
         self.settings_btn = IconButton(right, "settings", "Settings, shortcuts and usage",
                                        command=self._open_settings, size=38)
-        for w in (self.large_btn, self.export_btn, self.settings_btn):
+        self.subs_btn = IconButton(right, "fullscreen", "Subtitle window for a projector (F11)",
+                                   command=self._open_subtitles, size=38)
+        for w in (self.large_btn, self.subs_btn, self.export_btn, self.settings_btn):
             w.pack(side="left", padx=S(1))
 
     def _build_card(self, card):
@@ -221,8 +234,25 @@ class App:
 
         rec = tk.Frame(col, bg=bg)
         rec.grid(row=7, column=0, sticky="we", pady=(S(6), 0))
-        self.record_btn = RecordButton(rec, command=self._on_record)
-        self.record_btn.pack()
+        row = tk.Frame(rec, bg=bg)
+        row.pack()
+        side_l = tk.Frame(row, bg=bg, width=S(96))
+        side_l.pack(side="left", fill="y")
+        self.mute_btn = IconButton(side_l, "speaker", "Mute the spoken translation (Ctrl+M)",
+                                   command=self._toggle_mute, size=48, variant="secondary")
+        self.mute_btn.pack(side="bottom", pady=(0, S(4)))
+        self.mute_caption = tk.Label(side_l, text="Voice on", bg=bg, fg=C("text_3"),
+                                     font=theme.T.font(11, 600))
+        self.mute_caption.pack(side="bottom")
+        self.record_btn = RecordButton(row, command=self._on_record)
+        self.record_btn.pack(side="left")
+        side_r = tk.Frame(row, bg=bg, width=S(96))
+        side_r.pack(side="left", fill="y")
+        self.subs_btn2 = IconButton(side_r, "fullscreen", "Subtitle window for a projector (F11)",
+                                    command=self._open_subtitles, size=48, variant="secondary")
+        self.subs_btn2.pack(side="bottom", pady=(0, S(4)))
+        tk.Label(side_r, text="Subtitles", bg=bg, fg=C("text_3"),
+                 font=theme.T.font(11, 600)).pack(side="bottom")
         self.status_label = tk.Label(rec, text="Ready", bg=bg, fg=C("text_2"),
                                      font=theme.T.font(13, 500), justify="center")
         self.status_label.pack(fill="x")
@@ -284,6 +314,7 @@ class App:
         row = SettingRow(body, "Mute voice", sub="Captions only. Nothing is spoken.")
         row.grid(row=2, column=0, sticky="we", pady=(S(4), 0))
         Toggle(row.right, self.mute_var, command=self._on_mute, label="Mute voice").pack()
+        self.mute_var.trace_add("write", lambda *a: self._show_mute())
 
         self.pause_var = tk.BooleanVar(value=False)
         row = SettingRow(body, "Pause listening while the voice speaks",
@@ -322,8 +353,9 @@ class App:
                                command=self._skip_voice, tooltip="Skip the voice (Esc)", lang="en")
         self.skip_btn.pack(side="left", padx=(S(4), 0))
         self.auto_var = tk.BooleanVar(value=config.ONSITE_AUTO_ALTERNATE)
-        Toggle(tools, self.auto_var, command=self._on_auto_alternate,
-               label="Auto-switch turns").pack(side="right")
+        self.auto_cb = Toggle(tools, self.auto_var, command=self._on_auto_alternate,
+                              label="Auto-switch turns (when a side is chosen)")
+        self.auto_cb.pack(side="right")
         tk.Label(tools, text="Auto-switch turns", bg=bg, fg=C("text_2"),
                  font=theme.T.font(13, 500)).pack(side="right", padx=(0, S(4)))
         self._show_floor()
@@ -424,6 +456,14 @@ class App:
         return self.devices.loopbacks if self.source_var.get() == "loopback" else self.devices.mics
 
     def _on_source_change(self):
+        mic = self.source_var.get() == "mic"
+        if mic != getattr(self, "_source_was_mic", False):
+            self._source_was_mic = mic
+            if mic and not self.pause_var.get():
+                # Always-on mic + spoken translation: protect against the app
+                # hearing its own voice by default (the user can turn it off).
+                self.pause_var.set(True)
+                self._pause_while_speaking = True
         devs = self._input_choices()
         names = [d.name for d in devs]
         self.in_combo["values"] = names
@@ -462,6 +502,8 @@ class App:
         elif in_dev.kind == "mic" and not self.pause_var.get():
             msg = ("Mic mode: if the voice plays on speakers in the room, the mic will pick it "
                    "up. Use headphones, or turn on 'Pause listening while the voice speaks'.")
+        if self.mute_var.get() and in_dev is not None and out_dev is not None:
+            msg = ""  # subtitles only: nothing is spoken, so nothing to feed back
         danger = "⚠" in msg
         if getattr(self, "_compact", False) and not danger:
             msg = ""  # while live, only real risks stay on screen
@@ -515,7 +557,9 @@ class App:
             self.mode_var.set(self.turn.mode)  # the floor decides the direction
         mode = self.mode_var.get()
         self._onsite_live = onsite
-        self.echo = EchoFilter() if onsite else None
+        # Text echo guard in every setting: drops a result that repeats what the
+        # voice just said (inert while muted, since nothing is said).
+        self.echo = EchoFilter()
         self._voice_choice = voices.chosen()
         self.session = sess = Session()
         sess.run_start(self._start_worker, in_dev, out_dev, render_dev, muted, mode, onsite)
@@ -540,11 +584,12 @@ class App:
             post(self._set_transcript, sess.transcript)
             # Registered first, so it is closed last (after TTS reported its outcomes).
             lat = LatencyLog(config.LOG_DIR / f"latency-{datetime.now():%Y%m%d-%H%M%S}.jsonl",
-                             on_row=lambda row: post(self._show_latency, row))
+                             on_row=lambda row: post(self._show_latency, row),
+                             keep_rows=LATENCY_ROWS_KEPT)
             sess.latency = sess.own("latency", lat, lambda l: l.close())
 
             pump = AudioPump(is_paused=self._is_listening_paused,
-                             buffer_s=config.SWITCH_BUFFER_S)
+                             buffer_s=config.RECONNECT_BUFFER_S)
             sess.pump = sess.own("pump", pump, lambda p: p.stop())
             pump.start()
 
@@ -571,6 +616,7 @@ class App:
                 on_status=lambda st, m: post(self.set_status, st, m),
                 on_fatal=lambda m: post(self._fail, sess, m),
                 mode=mode,
+                on_gap=lambda at, secs: post(self._note_gap, at, secs),
             )
             # Registered before start(): stopping it is what aborts a pending connect.
             sess.controller = sess.own("controller", controller, lambda c: c.stop(),
@@ -722,8 +768,9 @@ class App:
                 rb.configure(state="disabled")
             self.lang_row.grid_remove()
             self.turn_frame.grid(row=3, column=0, sticky="we", pady=(S(10), 0))
-            self.setting_hint.configure(text="Two people, one device. Tap who is speaking; the "
-                                             "mic pauses while the translation is read out.")
+            self.setting_hint.configure(text="Two people, one device. Just talk: the language of "
+                                             "each sentence is detected. The mic pauses only while "
+                                             "the translation is read out.")
         else:
             if self.state is State.IDLE:
                 self.rb_loop.configure(state="normal")
@@ -809,6 +856,9 @@ class App:
     def _show_interim(self, source_text: str, translated: str, src: str, tgt: str):
         self._interim_at = time.monotonic()
         self.messages.set_interim(source_text, translated, src, tgt)
+        view = self.subtitle_view
+        if view is not None:
+            view.show_interim(source_text, translated, src, tgt)
 
     def _show_final(self, seg: Segment):
         shown = time.monotonic()
@@ -825,6 +875,10 @@ class App:
         self._last_seg_id = seg_id
         self.messages.add_message(seg_id, seg.source_text, seg.translated_text,
                                   seg.source_lang, seg.target_lang, seg.start)
+        view = self.subtitle_view
+        if view is not None:
+            view.show_final(seg.source_text, seg.translated_text, seg.source_lang,
+                            seg.target_lang)
         if self.transcript:
             try:
                 self.transcript.add(seg)
@@ -898,7 +952,10 @@ class App:
 
     def _refresh_live(self):
         state, muted = self._live_state()
-        self.record_btn.set_state(state, level=self._level, mic_muted=muted)
+        hint = None
+        if state in ("listening", "translating") and self.mute_var.get():
+            hint = "Listening · voice off, subtitles only"
+        self.record_btn.set_state(state, level=self._level, mic_muted=muted, hint=hint)
         tts = self.tts
         speaking = tts is not None and tts.state() == "speaking"
         self.messages.set_playing(self._playing_ids if speaking else ())
@@ -912,6 +969,9 @@ class App:
         if tts is None or self.state is not State.RUNNING:
             self.set_status(None, "Replay works while the translator is running.")
             return False
+        if self.mute_var.get():
+            self.set_status(None, "The voice is muted (subtitles only). Unmute to replay.")
+            return False
         return tts.replay(seg.translated_text, seg.target_lang, seg_id)
 
     def _replay_last(self):
@@ -922,7 +982,9 @@ class App:
         self.usage.session_chars += n  # int += is fine across threads here
 
     def _is_listening_paused(self) -> bool:
-        """Feedback gate, checked per captured chunk. Always on in onsite mode."""
+        """Feedback gate, checked per captured chunk. Always on in onsite mode,
+        never while muted (TtsQueue.is_busy is False then): the mic captures
+        100 % of the time in subtitles-only mode."""
         tts = self.tts
         if tts is None or not (self._pause_while_speaking or self._onsite_live):
             return False
@@ -937,10 +999,10 @@ class App:
             echo.spoken(utt.text, utt.lang)
 
     # ---------------------------------------------------------------- onsite
-    def _give_floor(self, side: str):
+    def _give_floor(self, side):
         if self.setting_var.get() != "onsite":
             return
-        mode = self.turn.give_floor(side)
+        mode = self.turn.give_floor(None if side == "auto" else side)
         self._show_floor()
         if mode is not None:
             self.mode_var.set(mode)
@@ -963,8 +1025,12 @@ class App:
         self.turn.auto_alternate = self.auto_var.get()
 
     def _show_floor(self):
-        if self.floor_var.get() != self.turn.side:
-            self.floor_var.set(self.turn.side)
+        value = self.turn.side or "auto"
+        if self.floor_var.get() != value:
+            self.floor_var.set(value)
+        cb = getattr(self, "auto_cb", None)
+        if cb is not None:  # passing the turn only means something for a chosen side
+            cb.configure(state="disabled" if self.turn.side is None else "normal")
 
     def _onsite_tick(self):
         try:
@@ -990,13 +1056,59 @@ class App:
         phase = phase_of(tts_state, ctl.is_switching)
         token, text = PHASE_BANNER[phase]
         if isinstance(text, dict):
-            text = text[self.turn.side]
+            text = text[self.turn.side or "auto"]
         self.phase_label.configure(text=text, bg=C(token))
 
     def _on_mute(self):
+        """Subtitles-only toggle. Never touches the mic or the recognizer."""
+        muted = self.mute_var.get()
         if self.tts:
-            self.tts.set_muted(self.mute_var.get())
+            self.tts.set_muted(muted)  # stops the current sentence, clears the queue
+        if muted:
+            self._playing_ids = ()
         self._update_options_summary()
+        self._update_feedback_warning()
+        self._show_mute()
+
+    def _toggle_mute(self):
+        self.mute_var.set(not self.mute_var.get())
+        self._on_mute()
+
+    def _show_mute(self):
+        muted = self.mute_var.get()
+        self.mute_btn.configure(icon="mute" if muted else "speaker")
+        self.mute_btn.set_toggled(muted)
+        self.mute_btn.label = ("Unmute the spoken translation (Ctrl+M)" if muted
+                               else "Mute the spoken translation (Ctrl+M)")
+        self.mute_caption.configure(text="Voice off" if muted else "Voice on",
+                                    fg=C("primary") if muted else C("text_3"))
+
+    def _note_gap(self, lost_at: float, seconds: float):
+        """A connection outage is over; say so where the missing speech would be."""
+        when = datetime.fromtimestamp(lost_at).strftime("%H:%M:%S")
+        kept = min(seconds, config.RECONNECT_BUFFER_S)
+        if seconds <= config.RECONNECT_BUFFER_S:
+            text = (f"Connection dropped at {when} and came back after {seconds:.0f} s. "
+                    "Speech in that time was buffered and translated.")
+        else:
+            text = (f"Connection dropped at {when} for {seconds:.0f} s. Only the last "
+                    f"{kept:.0f} s were buffered; speech before that was not translated.")
+        self._note(text)
+
+    # ------------------------------------------------------- subtitle view
+    def _open_subtitles(self):
+        if self.subtitle_view is not None and not self.subtitle_view.closed:
+            self.subtitle_view.win.lift()
+            self.subtitle_view.win.focus_force()
+            return
+
+        def closed():
+            self.subtitle_view = None
+        self.subtitle_view = SubtitleView(self.root, on_close=closed)
+        seg = self._segs.get(self._last_seg_id) if self._last_seg_id else None
+        if seg is not None:
+            self.subtitle_view.show_final(seg.source_text, seg.translated_text,
+                                          seg.source_lang, seg.target_lang)
 
     def _on_mode_change(self):
         sess = self.session

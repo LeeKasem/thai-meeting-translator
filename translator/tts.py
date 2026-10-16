@@ -183,7 +183,14 @@ class TtsQueue:
             player.close()  # waits for an in-flight write, then aborts the stream
         self._synth = None
 
+    @property
+    def muted(self) -> bool:
+        return self._muted
+
     def set_muted(self, muted: bool) -> None:
+        """Muted = subtitles only: the sentence being spoken stops at once, the
+        queue is cleared, nothing new is queued, and replays are refused.
+        Unmuting speaks only sentences that arrive afterwards (no backlog)."""
         cleared = []
         with self._cv:
             self._muted = muted
@@ -191,6 +198,7 @@ class TtsQueue:
                 cleared = list(self._q)
                 self._q.clear()
                 self._cancel.set()  # cut off the sentence being spoken
+                self._pause_until = 0.0  # no echo tail: nothing is playing any more
             self._cv.notify_all()
         for u in cleared:
             self._timing(u, {"outcome": "muted"})
@@ -218,7 +226,8 @@ class TtsQueue:
         return True
 
     def replay(self, text: str, lang: str, seg_id: Optional[int] = None) -> bool:
-        """Play `text` next (after the current utterance). False if not running."""
+        """Play `text` next (after the current utterance). False if not running
+        or muted (muted means no audio at all, and the mic isn't gated then)."""
         text = text.strip()
         if not text:
             return False
@@ -226,7 +235,7 @@ class TtsQueue:
             raise ValueError(f"no voice configured for {lang!r}")
         ids = () if seg_id is None else (seg_id,)
         with self._cv:
-            if not self._running or self._closed:
+            if not self._running or self._closed or self._muted:
                 return False
             # Several replays requested in a row keep their order.
             pos = 0
@@ -271,8 +280,9 @@ class TtsQueue:
         self.tail_s = max(0.0, seconds)
 
     def is_busy(self) -> bool:
-        """True while speaking, plus the echo tail afterwards (feedback gate)."""
-        if self._closed:
+        """True while speaking, plus the echo tail afterwards (feedback gate).
+        Never while muted: then the mic must capture 100 % of the time."""
+        if self._closed or self._muted:
             return False
         return self._speaking or time.monotonic() < self._pause_until
 
@@ -423,7 +433,7 @@ class TtsQueue:
         info["voice_s"] = round(len(pcm) / (TTS_RATE * 2), 2)
         if self._closed:
             return
-        if self._muted and not item.replay:
+        if self._muted:
             self._timing(item, dict(info, outcome="muted"))
             return
         if self._cancel.is_set() or not self._running:

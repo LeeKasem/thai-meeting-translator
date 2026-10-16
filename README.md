@@ -143,8 +143,12 @@ card. The card being read aloud is highlighted. In *Auto-detect* and
 Thai right in green). The list follows the newest card; scroll up and it
 stays put, with a **Jump to latest** button. Right-click a card to copy it.
 
+Next to the mic: **🔊 Voice on / 🔇 Voice off** (Ctrl+M) mutes the spoken
+translation at any time without touching the mic or the subtitles (see
+*Long sessions* below), and **⤢ Subtitles** (F11) opens the projector view.
+
 Top bar: **Aa** large text (for showing the screen to the other person),
-**⤓** export, **⚙** shortcuts and usage. Light or dark follows your Windows
+**⤢** subtitle window, **⤓** export, **⚙** shortcuts and usage. Light or dark follows your Windows
 app mode, and animations are off when Windows *Animation effects* is off.
 
 If Windows blocks desktop apps from the microphone (Settings → Privacy &
@@ -191,7 +195,8 @@ headphones.
 
 **Only one output device?** Do one of these:
 
-- Turn on **Mute voice** and just read the captions. This also saves TTS characters.
+- Turn on **Voice off** (Ctrl+M) and just read the captions. This also saves TTS
+  characters, and the mic is then never paused.
 - Turn on **Pause listening while the voice speaks**. The app sends silence to Azure
   while the Thai voice plays (plus 0.4 s of echo tail). English spoken during
   that time is **missed**.
@@ -199,23 +204,24 @@ headphones.
 The app shows a red warning when the voice output and the captured loopback
 device are the same.
 
-**Microphone mode (in-room):** play the Thai voice on headphones, or turn on
-*Pause listening while the voice speaks*. Otherwise the mic picks up the Thai
-voice. Also keep your microphone **muted in Teams/Zoom** if the Thai voice
+**Microphone mode (in-room):** play the Thai voice on headphones, or keep
+*Pause listening while the voice speaks* on (it switches on by itself when
+you choose Microphone). Otherwise the mic picks up the Thai voice. Also keep your microphone **muted in Teams/Zoom** if the Thai voice
 plays on speakers, or the other participants will hear it.
 
 ## 4b. Onsite conversation (two people, one device)
 
-Choose **Onsite** in the pill switch. The app then uses the microphone,
-always mutes it while the voice speaks, and lets one side talk at a time.
+Choose **Onsite** in the pill switch. The app then uses the microphone and
+pauses it only while the voice speaks.
 
-- **Whose turn:** the switch **English · อังกฤษ [F1]** / **ไทย · Thai [F2]**
-  gives the floor to that person. Only their language is recognized and
-  translated (English speaker → Thai voice, Thai speaker → English voice).
-  The language pills are replaced by this switch.
-- **Auto-switch turns** (on by default): once the translation has been read
-  out, the floor passes to the other person. Press your own button again to
-  keep talking.
+- **Auto · อัตโนมัติ [F4]** (the default): just talk. The mic stays open for
+  both people and the detected language of each sentence decides the
+  direction and the voice (English → Thai voice, Thai → English voice), with
+  no reconnect between speakers.
+- **English · อังกฤษ [F1]** / **ไทย · Thai [F2]** locks the direction to that
+  person, if detection picks the wrong language (e.g. lots of English words
+  in Thai). **Auto-switch turns** then passes the floor to the other person
+  once the translation has been read.
 - **Banner:** green = speak now · blue = switching turn (you can already
   start speaking; that audio is buffered) · amber = translating · red =
   reading the translation, please wait.
@@ -227,11 +233,12 @@ always mutes it while the voice speaks, and lets one side talk at a time.
   any, still plays. **Replay [F3]** reads the last translation again (see
   *Replay* below).
 
-Limits: anything said while the banner is red is **not heard**. This is
-turn-taking, not echo cancellation. Each turn change reconnects the
-recognizer (the free tier allows one connection). The previous speaker's last
-sentence is still finished and the next speaker's audio is buffered, so
-nothing is lost, but the first translation of a turn comes a little later.
+Limits: anything said while the banner is red is **not heard** (unless the
+voice is off). This is gating, not echo cancellation. With a locked side,
+each turn change reconnects the recognizer (the free tier allows one
+connection); the previous speaker's last sentence is still finished and the
+next speaker's audio is buffered, so nothing is lost, but the first
+translation of a turn comes a little later. Auto needs no reconnects.
 
 ## 5. Transcripts
 
@@ -253,8 +260,8 @@ nothing is lost, but the first translation of a turn comes a little later.
 | Wrong key | *Azure rejected the key…*, with **no reconnect** |
 | Wrong region | *Region 'xyz' was not found…*, with **no reconnect** |
 | AuthenticationFailure / BadRequest / Forbidden from the SDK | Clear error, no reconnect |
-| Network drop during a working session | *Reconnecting in Ns (attempt k/5)…*, with backoff of 1, 2, 4, 8 and 15 s |
-| 5 failed reconnects | *Gave up… Press Start to try again* |
+| Network drop, service timeout or session ended by Azure, during a working session | *Reconnecting in Ns (attempt k)…* with backoff of 1, 2, 4, 8, 15, then every 30 s. It **never gives up** on its own; Stop ends it. Subtitles, history, voice and mute state are kept. When it is back, a note in the conversation says how long it was away |
+| Speech during an outage | The last 20 s (`RECONNECT_BUFFER_S`) are buffered and translated once it is back; the note says if more was lost |
 | Stop pressed while reconnecting | Stops at once; no new connection opens |
 | Stop pressed while still starting (key check, opening the device, connecting) | Start is abandoned; anything already opened is closed; nothing connects afterwards |
 | Stop pressed while the voice is speaking | The voice cuts off within ~0.1 s; queued sentences are dropped; nothing plays after Stop |
@@ -262,7 +269,8 @@ nothing is lost, but the first translation of a turn comes a little later.
 
 Each drop is counted once, even though the SDK reports both *canceled* and
 *session stopped* for the same drop. A session that stays connected for 60 s
-resets the retry counter. Before connecting, the app checks the key and
+resets the backoff. To give up after N attempts instead, set
+`MAX_RECONNECT_ATTEMPTS = N` in `translator/config.py`. Before connecting, the app checks the key and
 region against Azure's token endpoint. Without that check, a wrong region
 looks exactly like a network failure in the SDK.
 
@@ -278,12 +286,57 @@ Sentences are read one at a time and never overlap.
 **Replay:** click **▶** on any message card to hear that translation again,
 or press **F3** for the last one. A replay plays right after
 the sentence currently being read (it doesn't cut it off), ahead of anything
-waiting. It is never skipped or merged, and plays even with *Mute voice* on,
-because you asked for it. The last 50 spoken translations are kept in
+waiting. It is never skipped or merged. With the voice off it is refused:
+off means no audio at all, and the mic isn't paused then. The last 50 spoken translations are kept in
 memory, so replaying them is instant and uses no TTS characters. Older ones,
 or ones that were skipped, are synthesized again. Replay works while the
 translator is running. In onsite mode the microphone is muted during a
 replay, as for any voice output.
+
+## 6b. Long sessions (lectures, presentations, all-day meetings)
+
+Press the mic once; it stays open until you press it again. Recognition is
+continuous (`start_continuous_recognition_async`): nothing stops after a
+sentence or after silence, and no Start/Stop is needed between sentences.
+
+- **Live subtitles:** the partial sentence shows as a **Live** card (and in
+  the subtitle window) and is replaced by the final text and translation.
+- **Voice off (subtitles only), Ctrl+M:** the sentence being read stops at
+  once, the queue is cleared, nothing new is queued, and the mic is never
+  paused (100 % capture). Recognition, translation and subtitles carry on.
+  **Voice on** speaks only sentences from then on, not the backlog. The
+  choice stays for the session (and the next one).
+- **Voice on with a mic:** feedback protection stays on: the mic is replaced
+  by silence while the voice plays plus a short tail, and a result that
+  repeats what the voice just said is dropped. The recognizer keeps running
+  through it; nothing is reset.
+- **Subtitle window (F11):** dark, very large, bottom-anchored subtitles for
+  a projector. Drag it to the projector screen, then F11 (or double-click)
+  for full screen. A−/A+ size, *Original* shows or hides the source line,
+  Esc leaves full screen.
+- **Memory:** the conversation draws the newest 200 cards; older ones are
+  dropped from the screen in batches while you follow the newest line
+  (*Show earlier* brings them back). Every sentence stays in memory for
+  replay and in the transcript file. The voice cache (50), latency rows in
+  memory (500), recognizer records and the audio buffer are all capped.
+
+**Soak test** (real Azure, mic and speaker; needs `.env`): a voice reads the
+test phrases on the speaker, over and over, and the app's pipeline listens
+through the mic. It reports missed, duplicated and late sentences, outages,
+audio that played while muted, latency (first vs last third of the run),
+and memory/CPU over time, in `results/soak-…/summary.md`.
+
+```powershell
+python -m tools.soak --minutes 30                         # meeting, auto-detect, voice on
+python -m tools.soak --minutes 30 --setting onsite        # onsite settings
+python -m tools.soak --minutes 30 --mute                  # subtitles only
+python -m tools.soak --minutes 30 --mute-every 5 --drop-every 10   # toggle voice, force reconnects
+python -m tools.soak --minutes 30 --pace lecture --mute   # back-to-back speech
+python -m tools.soak --offline --minutes 120 --speed 40   # no Azure: the window, 2 h simulated
+```
+
+A 30-minute live run uses about 30 of the 300 free translation minutes a
+month, and with the voice on about 15–20k of the 500k free TTS characters.
 
 ## 7. Verification checklist
 
@@ -307,6 +360,7 @@ Manual checks:
 - [ ] Run for 15 minutes: no "Reconnecting" without a real network drop, and the voice queue stays at 0–2.
 - [ ] Open the exported `.txt` in Notepad and the `.srt` in VLC or Notepad. The Thai text shows correctly.
 - [ ] `python -m tools.measure --source speaker` and `--source human` (auto), then `--mode floor`: read `summary.md` (section 8).
+- [ ] Long sessions: `python -m tools.soak --minutes 30` in both settings, voice on and `--mute`, once with `--mute-every 5 --drop-every 10`: no missed or duplicated phrases beyond a few, every outage recovered, no audio while muted, memory flat (section 6b).
 
 ### Interface states
 
@@ -411,6 +465,7 @@ translator/latency.py   per-stage latency: stream clock, per-sentence log, stage
 translator/transcript.py   auto-save and .txt/.srt export
 translator/usage.py     session and monthly usage counter
 translator/ui.py        the window: wires the components to the session logic
+translator/subtitle_view.py  projector subtitle window
 translator/theme.py     design tokens (colours, radii, shadows, motion, fonts), light/dark
 translator/widgets.py   Button, IconButton, PillTabs, PillSelect, Toggle, Modal, RecordButton, ...
 translator/messages.py  conversation list (message cards, live card, jump to latest)
@@ -422,7 +477,8 @@ translator/assets/fonts Plus Jakarta Sans + Noto Sans Thai (SIL Open Font Licens
 tools/measure.py        detection accuracy + latency measurement with real Azure/mic/speaker
 tools/phrases.tsv       test phrases for it
 tools/latency_report.py summary of the app's logs/latency-*.jsonl
-tests/                  unit tests (core, lifecycle, bidirectional, onsite, queue/replay, latency, measure, UI components)
+tools/soak.py           long-session soak test (live, or offline accelerated UI)
+tests/                  unit tests (core, lifecycle, bidirectional, onsite, queue/replay, latency, measure, UI components, long-form)
 ```
 
 ## License

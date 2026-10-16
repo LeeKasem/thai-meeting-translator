@@ -179,7 +179,7 @@ class Fakes:
                 f.ttss.append(self)
 
             def set_muted(self, m):
-                pass
+                self.muted = m
 
             def start(self, player):
                 self.player = player
@@ -207,7 +207,7 @@ class Fakes:
                 return self.behind
 
             def is_busy(self):
-                return self.busy
+                return self.busy and not self.muted  # TtsQueue: never busy while muted
 
             def state(self):
                 return self.tts_state
@@ -318,7 +318,8 @@ def headless_app(setting="meeting"):
               "status_label", "queue_label", "messages", "usage_label", "rb_meeting", "rb_onsite",
               "pause_cb", "turn_frame", "lang_row", "phase_label", "skip_btn", "head",
               "setting_tabs", "setting_hint", "options_body", "options_btn", "options_summary",
-              "src_select", "tgt_select", "swap_btn", "voice_btn", "warn_label", "card"):
+              "src_select", "tgt_select", "swap_btn", "voice_btn", "warn_label", "card",
+              "mute_btn", "mute_caption"):
         setattr(app, w, mock.MagicMock())
     app.mode_rbs = []
     app.options_open = True
@@ -332,6 +333,7 @@ def headless_app(setting="meeting"):
     app._playing_ids = ()
     app._status_state = "idle"
     app._interim_at = 0.0
+    app.subtitle_view = None
     app.setting_var = Var(setting)
     app.source_var = Var("mic")
     app.pause_var = Var(False)

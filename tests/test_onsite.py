@@ -389,6 +389,8 @@ class OnsiteAppTest(unittest.TestCase):
         with Fakes() as f:
             app = self.start(f)
             tts, ctl = f.ttss[0], f.controllers[0]
+            app._give_floor("en")  # auto-alternate applies to a locked side
+            ctl.modes.clear()
             app._show_final(Segment(0, 1, "How much is it?", "ราคาเท่าไร", "en", "th"))
             tts.tts_state = "speaking"
             app._update_onsite()

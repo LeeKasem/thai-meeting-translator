@@ -10,8 +10,11 @@ Rules (lessons from the earlier caption web app):
   both arrive for one drop; the second is ignored.
 - Reconnect only happens if this Start already reached a live connection.
   Failing to connect at all is reported as an error.
-- Retries are capped; a session that stayed up STABLE_SESSION_S resets the
-  counter. Stop wakes the backoff wait and cancels the reconnect.
+- Retries back off (1 s .. 30 s) and, for long-form use, never give up on
+  their own (MAX_RECONNECT_ATTEMPTS = None); a session that stayed up
+  STABLE_SESSION_S resets the backoff. Stop wakes the backoff wait and
+  cancels the reconnect. Each outage is reported once, when the connection
+  is back, through `on_gap(lost_at_epoch, seconds)`.
 - The old recognizer is fully stopped before a new one opens (F0 allows one
   concurrent recognition connection). Opening is serialized by `_open_lock`,
   shared by start, reconnect and direction switches.
@@ -86,7 +89,8 @@ class RecognitionController:
                  on_final: Callable[[Segment], None],
                  on_status: Callable[[str, str], None],
                  on_fatal: Callable[[str], None],
-                 mode: str = config.DEFAULT_MODE):
+                 mode: str = config.DEFAULT_MODE,
+                 on_gap: Optional[Callable[[float, float], None]] = None):
         config.direction(mode)  # validates
         self.creds = creds
         self.pump = pump
@@ -96,6 +100,9 @@ class RecognitionController:
         self.on_final = on_final
         self.on_status = on_status  # (state, message)
         self.on_fatal = on_fatal
+        self.on_gap = on_gap  # (epoch when the connection was lost, seconds offline)
+        self._lost_at: Optional[Tuple[float, float]] = None  # (epoch, monotonic)
+        self.gaps = 0
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._gen = 0
@@ -288,8 +295,12 @@ class RecognitionController:
         clock = self.pump.set_sink(push)
         with self._lock:
             self._clocks[gen] = clock
-            for old in [g for g in self._clocks if g < gen - 2]:
-                del self._clocks[old]  # keep the flushing generation's clock
+            # Bounded over long sessions: keep only recent generations (the
+            # flushing one may still deliver results).
+            for d in (self._clocks, self._stream_start, self._connected_at):
+                for old in [g for g in d if g < gen - 2]:
+                    del d[old]
+            self._handled_drop = {g for g in self._handled_drop if g >= gen - 2}
         rec.start_continuous_recognition_async().get()
         # Stop may have run while we were starting; don't leave an orphan.
         with self._lock:
@@ -335,7 +346,13 @@ class RecognitionController:
             return
         self._connected_at[gen] = time.monotonic()
         self._ever_connected = True
+        with self._lock:
+            lost, self._lost_at = self._lost_at, None
         self.on_status("listening", f"Listening ({config.mode_label(mode or self._mode)})")
+        if lost is not None:
+            self.gaps += 1
+            if self.on_gap is not None:
+                self.on_gap(lost[0], time.monotonic() - lost[1])
 
     def _on_recognizing(self, gen: int, mode: str, evt) -> None:
         if not self._accepts_results(gen):
@@ -437,28 +454,38 @@ class RecognitionController:
                     return
                 rec, push, conn = self._rec, self._push, self._conn
                 self._rec = self._push = self._conn = None
+                if self._lost_at is None:  # first drop of this outage
+                    self._lost_at = (time.time(), time.monotonic())
+            # Meanwhile the pump buffers the audio (RECONNECT_BUFFER_S) and
+            # replays it into the next recognizer.
             self.pump.set_sink(None)
             self._teardown(rec, push, conn)
 
-        if self._attempts >= config.MAX_RECONNECT_ATTEMPTS:
-            msg = f"Connection lost ({reason}). Gave up after " \
-                  f"{config.MAX_RECONNECT_ATTEMPTS} reconnect attempts. Press Start to try again."
-            if code == Code.TooManyRequests:
-                msg += " (F0 allows one session at a time.)"
-            self.on_fatal(msg)
-            return
-        delay = config.RECONNECT_BACKOFF_S[min(self._attempts, len(config.RECONNECT_BACKOFF_S) - 1)]
-        self._attempts += 1
-        self.on_status("reconnecting",
-                       f"Connection lost ({reason}). Reconnecting in {delay}s "
-                       f"(attempt {self._attempts}/{config.MAX_RECONNECT_ATTEMPTS})…")
-        if self._stop.wait(delay):
-            return  # Stop pressed during the wait
-        try:
-            with self._open_lock:
-                with self._lock:
-                    if self._rec is not None:
-                        return  # a direction switch already opened a new one
-                self._open()
-        except Exception as e:  # SDK object creation failed
-            self.on_fatal(f"Reconnect failed: {e}")
+        cap = config.MAX_RECONNECT_ATTEMPTS
+        while not self._stop.is_set():
+            if cap is not None and self._attempts >= cap:
+                msg = f"Connection lost ({reason}). Gave up after " \
+                      f"{cap} reconnect attempts. Press Start to try again."
+                if code == Code.TooManyRequests:
+                    msg += " (F0 allows one session at a time.)"
+                self.on_fatal(msg)
+                return
+            backoff = config.RECONNECT_BACKOFF_S
+            delay = backoff[min(self._attempts, len(backoff) - 1)]
+            self._attempts += 1
+            of = f"/{cap}" if cap is not None else ""
+            self.on_status("reconnecting",
+                           f"Connection lost ({reason}). Reconnecting in {delay}s "
+                           f"(attempt {self._attempts}{of})…")
+            if self._stop.wait(delay):
+                return  # Stop pressed during the wait
+            try:
+                with self._open_lock:
+                    with self._lock:
+                        if self._rec is not None:
+                            return  # a direction switch already opened a new one
+                    self._open()
+                return  # a failure to connect comes back as canceled -> _drop
+            except Exception as e:  # SDK object creation failed: try again
+                log.warning("reconnect attempt failed: %s", e)
+                reason = f"reconnect failed: {e}"

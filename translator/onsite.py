@@ -39,8 +39,12 @@ class Phase(enum.Enum):
     TAIL = "tail"
 
 
-def mode_for(side: str) -> str:
-    """The direction for the side that has the floor: speaker's language -> other."""
+def mode_for(side) -> str:
+    """The direction for the side that has the floor: speaker's language ->
+    other. No side (None) = automatic: each sentence's detected language
+    decides (continuous language ID, no reconnect between speakers)."""
+    if side is None:
+        return config.MODE_AUTO
     mode = f"{side}>{config.other(side)}"
     config.direction(mode)  # validates
     return mode
@@ -59,9 +63,14 @@ def phase_of(tts_state: str, switching: bool) -> Phase:
 
 
 class TurnTaker:
-    """Who has the floor. Pure logic; the UI applies the returned modes."""
+    """Who has the floor. Pure logic; the UI applies the returned modes.
 
-    def __init__(self, first_side: str = config.PAIR[0],
+    side None (the default) = automatic: the mic stays open for both people
+    and the detected language of each sentence picks direction and voice.
+    Giving the floor to "en"/"th" locks the direction (a fallback if
+    detection misbehaves); auto-alternate only applies to a locked side."""
+
+    def __init__(self, first_side=config.ONSITE_DEFAULT_SIDE,
                  auto_alternate: bool = config.ONSITE_AUTO_ALTERNATE):
         mode_for(first_side)
         self.side = first_side
@@ -84,13 +93,14 @@ class TurnTaker:
 
     def on_final(self, source_lang: str) -> None:
         """A sentence from the side with the floor was accepted for reading."""
-        if self.auto_alternate and source_lang == self.side:
+        if self.auto_alternate and self.side is not None and source_lang == self.side:
             self._alternate_pending = True
 
     def poll(self, tts_state: str, switching: bool) -> Optional[str]:
         """Call regularly. Returns a new mode when auto-alternate passes the
         floor: only once the voice has finished (incl. the echo tail)."""
-        if self._alternate_pending and tts_state == "idle" and not switching:
+        if self._alternate_pending and self.side is not None and tts_state == "idle" \
+                and not switching:
             self._alternate_pending = False
             return self.give_floor(config.other(self.side))
         return None

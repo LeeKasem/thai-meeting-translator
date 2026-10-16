@@ -134,6 +134,11 @@ class VoicePicker:
         self.grid.bind("<Return>", lambda e: self._select_focused())
         self.grid.bind("<space>", lambda e: self._select_focused())
         self.grid.bind("<KeyPress-p>", lambda e: self._preview_focused())
+        # Bound once (per-item bindings would pile up a Tcl callback per redraw).
+        self.grid.tag_bind("vcard", "<Button-1>", lambda e: self._click("v", self._select))
+        self.grid.tag_bind("vprev", "<Button-1>", lambda e: self._click("p", self._preview))
+        self.grid.tag_bind("vcard", "<Enter>", lambda e: self.grid.configure(cursor="hand2"))
+        self.grid.tag_bind("vcard", "<Leave>", lambda e: self.grid.configure(cursor=""))
         self.grid.bind("<FocusIn>", lambda e: self._draw())
         self.grid.bind("<FocusOut>", lambda e: self._draw())
         hint = ("Arrow keys move, Enter selects, P plays a preview." if not self.running else
@@ -248,56 +253,61 @@ class VoicePicker:
             selected = self.current.get(lang) == v.name
             fill = C("primary_10") if selected else C("bg")
             border = C("primary") if selected else C("border")
-            tag = f"v{i}"
-            draw_box(g, x, y, w, h, S(14), fill, bg, border, tags=(tag,))
+            tag = (f"v{i}", "vcard")
+            draw_box(g, x, y, w, h, S(14), fill, bg, border, tags=tag)
             if focused and i == self.focus_i:
                 g.create_rectangle(x + 1, y + 1, x + w - 2, y + h - 2, outline=C("focus"), width=2,
-                                   tags=(tag,))
+                                   tags=tag)
             # avatar
             ad = S(40)
             female = v.gender == "Female"
             av_fill = mix(C("primary") if female else C("accent_2"), fill, 0.16)
             av_fg = C("primary") if female else C("accent_2")
             ax, ay = x + S(12) + ad // 2, y + h // 2
-            g.create_image(ax, ay, image=paint.circle(ad, av_fill, fill), tags=(tag,))
-            g.create_text(ax, ay, text=v.initials, font=th.T.font(15, 700), fill=av_fg, tags=(tag,))
+            g.create_image(ax, ay, image=paint.circle(ad, av_fill, fill), tags=tag)
+            g.create_text(ax, ay, text=v.initials, font=th.T.font(15, 700), fill=av_fg, tags=tag)
             # text
             tx = x + S(12) + ad + S(10)
             tw = w - (tx - x) - S(48)
             name_font = th.T.font(14, 600)
             g.create_text(tx, ay - S(9), text=ellipsize(v.display, name_font, tw), anchor="w",
-                          font=name_font, fill=C("primary") if selected else C("text"), tags=(tag,))
+                          font=name_font, fill=C("primary") if selected else C("text"), tags=tag)
             sub = f"{v.locale} · {v.gender}" if v.gender else v.locale
             if v.name == config.DEFAULT_VOICES.get(v.lang):
                 sub += " · default"
             g.create_text(tx, ay + S(10), text=ellipsize(sub, th.T.font(12), tw), anchor="w",
-                          font=th.T.font(12), fill=C("text_3"), tags=(tag,))
-            g.tag_bind(tag, "<Button-1>", lambda e, i=i: self._select(i))
-            g.tag_bind(tag, "<Enter>", lambda e: g.configure(cursor="hand2"))
-            g.tag_bind(tag, "<Leave>", lambda e: g.configure(cursor=""))
+                          font=th.T.font(12), fill=C("text_3"), tags=tag)
             # preview button
             pd = S(30)
             px, py = x + w - S(12) - pd // 2, ay
-            ptag = f"p{i}"
+            ptag = (f"p{i}", "vprev")
             can = self.previewer is not None and not self.running
             is_playing = self.playing == v.name
             pfill = C("primary") if is_playing else (C("bg") if can else mix(C("bg_muted"), fill, 0.5))
             g.create_image(px, py, image=paint.circle(pd, pfill, fill,
                                                       None if is_playing else C("border")),
-                           tags=(ptag,))
+                           tags=ptag)
             g.create_text(px + (0 if is_playing else S(1)), py,
                           text=th.T.icon("stop" if is_playing else "play"), font=th.T.icon_font(11),
                           fill=C("on_primary") if is_playing else (C("primary") if can else C("text_3")),
-                          tags=(ptag,))
-            g.tag_bind(ptag, "<Button-1>", lambda e, i=i: (self._preview(i), "break")[1])
+                          tags=ptag)
             if selected:
                 g.create_image(x + w - S(8), y + S(8), image=paint.circle(S(18), C("primary"), bg),
-                               tags=(tag,))
+                               tags=tag)
                 g.create_text(x + w - S(8), y + S(8), text=th.T.icon("check"),
-                              font=th.T.icon_font(9), fill=C("on_primary"), tags=(tag,))
+                              font=th.T.icon_font(9), fill=C("on_primary"), tags=tag)
         g.configure(scrollregion=(0, 0, W, last_y + S(4)))
 
     # ---------------------------------------------------------- actions
+    def _click(self, prefix, action):
+        for t in self.grid.gettags("current"):
+            if t.startswith(prefix) and t[len(prefix):].isdigit():
+                i = int(t[len(prefix):])
+                if i < len(self._items):
+                    action(i)
+                return "break"
+        return None
+
     def _select(self, i):
         v = self._items[i]
         self.focus_i = i

@@ -97,9 +97,14 @@ F0_TTS_TRANSACTIONS_PER_MINUTE = 20
 USAGE_WARN_FRACTION = 0.8
 
 # Reconnect policy: only for genuine connection drops after a working session.
-MAX_RECONNECT_ATTEMPTS = 5
-RECONNECT_BACKOFF_S = (1, 2, 4, 8, 15)
-STABLE_SESSION_S = 60  # a session this long resets the retry counter
+# Long-form use (lectures, all-day meetings): never give up on our own; keep
+# retrying with backoff until the user presses Stop. Set a number to cap it.
+MAX_RECONNECT_ATTEMPTS = None
+RECONNECT_BACKOFF_S = (1, 2, 4, 8, 15, 30)
+STABLE_SESSION_S = 60  # a session this long resets the backoff
+# Audio kept while the recognizer is away (reconnect or direction switch) and
+# replayed into the next one, so short outages lose no speech.
+RECONNECT_BUFFER_S = 20.0
 
 # TTS queue policy (see tts.py): meeting = catch up (drop the oldest unspoken
 # sentences beyond TTS_MAX_BACKLOG waiting); onsite = every sentence in order,
@@ -121,6 +126,9 @@ SWITCH_BUFFER_S = 5.0
 ONSITE_TAIL_S = 0.7
 # After a translation has been read, give the floor to the other side.
 ONSITE_AUTO_ALTERNATE = True
+# Who has the floor when onsite starts: None = automatic (the detected
+# language of each sentence decides; the mic stays open for both people).
+ONSITE_DEFAULT_SIDE = None
 # Text-based echo guard: a final result this similar (0..1) to something the
 # voice said within ECHO_WINDOW_S is treated as the app hearing itself.
 ECHO_SIMILARITY = 0.8

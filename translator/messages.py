@@ -3,6 +3,12 @@
 
 Everything is drawn on one canvas, so long meetings stay cheap: new cards
 are appended; a width change re-lays out (debounced).
+
+Long sessions (lectures, hours of meeting): every message is kept (as small
+dicts) but only the newest MAX_RENDERED are drawn. Older ones are dropped
+from the canvas in batches while the reader follows the newest line, and a
+"Show earlier" row at the top brings them back on request. The transcript
+file always has everything.
 """
 import tkinter as tk
 from datetime import datetime
@@ -13,6 +19,8 @@ from . import theme as th
 from .widgets import Button, C, S, draw_box, ellipsize, surface_of
 
 BADGE = {"en": "EN", "th": "TH"}
+MAX_RENDERED = 200   # cards + notes drawn at once
+EVICT_BATCH = 40     # drop this many at a time (one re-layout per batch)
 
 
 class MessageList(tk.Frame):
@@ -25,6 +33,7 @@ class MessageList(tk.Frame):
         self.cv.pack(fill="both", expand=True)
         self._bg = bg
         self.items: List[dict] = []
+        self._first = 0  # index of the first rendered item
         self.interim: Optional[dict] = None
         self.playing: set = set()
         self.large = False
@@ -49,6 +58,18 @@ class MessageList(tk.Frame):
             w.bind("<FocusOut>", lambda e: self._focus_ring(False))
             w.bind("<Button-1>", lambda e: self.cv.focus_set(), add="+")
         self._menu = tk.Menu(self, tearoff=0)
+        # Bound once per tag *type*. Binding per card would register a new Tcl
+        # callback for every card ever drawn (Tkinter never frees them when
+        # items are deleted), which grows without bound in long sessions.
+        cv = self.cv
+        cv.tag_bind("replay", "<Enter>", lambda e: self._replay_hover(True))
+        cv.tag_bind("replay", "<Leave>", lambda e: self._replay_hover(False))
+        cv.tag_bind("replay", "<Button-1>", self._replay_click)
+        cv.tag_bind("cardbody", "<Button-3>", self._card_menu)
+        cv.tag_bind("earlier_link", "<Button-1>", lambda e: self.show_earlier())
+        cv.tag_bind("earlier_link", "<Enter>", lambda e: cv.configure(cursor="hand2"))
+        cv.tag_bind("earlier_link", "<Leave>", lambda e: cv.configure(cursor=""))
+        self._hover_id = None
         self.bind("<Destroy>", self._on_destroy, add="+")
         self._draw_empty()
 
@@ -127,6 +148,17 @@ class MessageList(tk.Frame):
             self._relayout_job = self.after(60, self.relayout)
         self._place_jump()
 
+    @property
+    def rendered(self) -> int:
+        return len(self.items) - self._first
+
+    def show_earlier(self):
+        self._first = max(0, self._first - MAX_RENDERED)
+        self.stick = False
+        self.relayout()
+        self.cv.yview_moveto(0.0)
+        self._update_jump()
+
     def relayout(self):
         self._relayout_job = None
         self.cv.delete("all")
@@ -135,7 +167,9 @@ class MessageList(tk.Frame):
         if not self.items and self.interim is None:
             self._draw_empty()
             return
-        for it in self.items:
+        if self._first > 0:
+            self._draw_earlier()
+        for it in self.items[self._first:]:
             self._draw_item(it)
         self._draw_interim()
         if self.stick:
@@ -153,6 +187,10 @@ class MessageList(tk.Frame):
         self._draw_interim()
         if it["kind"] == "msg" and not self.stick:
             self.unseen += 1
+        if self.stick and self.rendered > MAX_RENDERED + EVICT_BATCH:
+            # Only while following the newest line, so a reader isn't moved.
+            self._first = len(self.items) - MAX_RENDERED
+            self.relayout()
         self._after_content()
 
     def _after_content(self):
@@ -185,6 +223,19 @@ class MessageList(tk.Frame):
                             anchor="n", font=th.T.font(13), fill=C("text_3"), tags="empty",
                             width=W - S(32), justify="center")
         self.cv.configure(scrollregion=(0, 0, W, H))
+
+    def _draw_earlier(self):
+        W = self._W()
+        n = self._first
+        t = self.cv.create_text(W // 2, self._y + S(4), anchor="n", tags=("earlier",),
+                                text=f"{n} earlier message{'s' if n != 1 else ''} not shown "
+                                     "(all are in the transcript)",
+                                font=th.T.font(12, 500), fill=C("text_3"))
+        y1 = self.cv.bbox(t)[3]
+        link = self.cv.create_text(W // 2, y1 + S(4), anchor="n", text="Show earlier",
+                                   font=th.T.font(13, 600), fill=C("primary"),
+                                   tags=("earlier", "earlier_link"))
+        self._y = self.cv.bbox(link)[3] + S(14)
 
     def _draw_item(self, it):
         if it["kind"] == "note":
@@ -225,7 +276,7 @@ class MessageList(tk.Frame):
 
     def _draw_card(self, it, y, live=False):
         cv = self.cv
-        tag = "live" if live else f"card{it['id']}"
+        tag = "live" if live else (f"card{it['id']}", "cardbody")
         x, cw, right = self._geometry(it)
         fill, border, fg_src, fg_tgt = self._colors(it, live)
         pad = S(16)
@@ -238,10 +289,11 @@ class MessageList(tk.Frame):
         hy = y + pad
         bw, bh = bfont.measure(badge) + S(14), S(22)
         badge_fill = th.mix(accent, fill, 0.12)
-        ids.append(cv.create_image(x + pad, hy, anchor="nw", tags=(tag, "fg"),
+        tag = tag if isinstance(tag, tuple) else (tag,)
+        ids.append(cv.create_image(x + pad, hy, anchor="nw", tags=tag + ("fg",),
                                    image=paint.pill(bw, bh, badge_fill, fill)))
         ids.append(cv.create_text(x + pad + bw // 2, hy + bh // 2, text=badge, font=bfont,
-                                  fill=accent, tags=(tag, "fg")))
+                                  fill=accent, tags=tag + ("fg",)))
         if live:
             meta = "● Live"
             meta_fill = C("danger")
@@ -252,25 +304,23 @@ class MessageList(tk.Frame):
                 meta += "  ·  Speaking"
                 meta_fill = C("primary")
         ids.append(cv.create_text(x + pad + bw + S(10), hy + bh // 2, text=meta, anchor="w",
-                                  font=th.T.font(12, 500), fill=meta_fill, tags=(tag, "fg")))
+                                  font=th.T.font(12, 500), fill=meta_fill, tags=tag + ("fg",)))
         if not live:
             self._draw_replay(it, x + cw - pad - S(14), hy + bh // 2, fill, tag)
         ty = hy + bh + S(10)
         sfont = th.T.font(15 if self.large else 13, 400, it["src"])
         t1 = cv.create_text(x + pad, ty, text=it["src_text"], anchor="nw", font=sfont,
-                            fill=fg_src, width=inner, tags=(tag, "fg"))
+                            fill=fg_src, width=inner, tags=tag + ("fg",))
         ty = cv.bbox(t1)[3] + S(6)
         tfont = th.T.font(28 if self.large else 17, 500, it["tgt"])
         t2 = cv.create_text(x + pad, ty, text=it["tgt_text"], anchor="nw", font=tfont,
-                            fill=fg_tgt if not live else C("text_2"), width=inner, tags=(tag, "fg"))
+                            fill=fg_tgt if not live else C("text_2"), width=inner, tags=tag + ("fg",))
         bottom = cv.bbox(t2)[3] + pad
         h = bottom - y
         box = draw_box(cv, x, y, cw, h, S(th.RADIUS_CARD), fill, self._bg, border,
-                       tags=(tag, "box"))
+                       tags=tag + ("box",))
         for i in box:
             cv.tag_lower(i, ids[0])
-        if not live:
-            cv.tag_bind(tag, "<Button-3>", lambda e, it=it: self._context(e, it))
         return h
 
     def _draw_replay(self, it, cx, cy, card_fill, tag):
@@ -283,16 +333,40 @@ class MessageList(tk.Frame):
                              None if playing else C("border"))
         img_h = paint.circle(d, C("primary_hover") if playing else C("primary_10"), card_fill,
                              None if playing else C("primary_30"))
-        ci = cv.create_image(cx, cy, image=img_n, tags=(tag, rtag, "fg"))
-        ti = cv.create_text(cx + (0 if playing else S(1)), cy,
-                            text=th.T.icon("speaker" if playing else "play"),
-                            font=th.T.icon_font(12),
-                            fill=C("on_primary") if playing else C("primary"), tags=(tag, rtag, "fg"))
-        cv.tag_bind(rtag, "<Enter>", lambda e: (cv.itemconfigure(ci, image=img_h),
-                                                cv.configure(cursor="hand2")))
-        cv.tag_bind(rtag, "<Leave>", lambda e: (cv.itemconfigure(ci, image=img_n),
-                                                cv.configure(cursor="")))
-        cv.tag_bind(rtag, "<Button-1>", lambda e: (self.on_replay(seg_id), "break")[1])
+        ci = cv.create_image(cx, cy, image=img_n, tags=tag + (rtag, "replay", "fg"))
+        cv.create_text(cx + (0 if playing else S(1)), cy,
+                       text=th.T.icon("speaker" if playing else "play"),
+                       font=th.T.icon_font(12),
+                       fill=C("on_primary") if playing else C("primary"),
+                       tags=tag + (rtag, "replay", "fg"))
+        it["rp"] = (ci, img_n, img_h)
+
+    def _id_under_pointer(self, prefix):
+        for t in self.cv.gettags("current"):
+            if t.startswith(prefix) and t[len(prefix):].isdigit():
+                return int(t[len(prefix):])
+        return None
+
+    def _replay_hover(self, on):
+        seg_id = self._id_under_pointer("rp") if on else self._hover_id
+        self._hover_id = seg_id if on else None
+        it = self._card_ids.get(seg_id) if seg_id is not None else None
+        if it is not None and "rp" in it:
+            ci, img_n, img_h = it["rp"]
+            self.cv.itemconfigure(ci, image=img_h if on else img_n)
+        self.cv.configure(cursor="hand2" if on else "")
+
+    def _replay_click(self, e):
+        seg_id = self._id_under_pointer("rp")
+        if seg_id is not None:
+            self.on_replay(seg_id)
+        return "break"
+
+    def _card_menu(self, e):
+        seg_id = self._id_under_pointer("card")
+        it = self._card_ids.get(seg_id) if seg_id is not None else None
+        if it is not None:
+            self._context(e, it)
 
     def _redraw_card(self, it):
         """Repaint one card in place (playing highlight); its height is unchanged."""

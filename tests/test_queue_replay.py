@@ -170,15 +170,20 @@ class ReplayPlaybackTest(unittest.TestCase):
         self.assertEqual(playing[1].seg_ids, (2, 3, 4))
         self.assertEqual(synth.calls, 2)
 
-    def test_replay_plays_even_when_muted(self):
+    def test_muted_means_no_audio_at_all(self):
+        """Subtitles-only: no live sentence and no replay (the mic is ungated
+        while muted, so any audio would be heard and re-translated)."""
         q, synth, player, _, playing = running()
         q.set_muted(True)
-        q.enqueue("live", "en", 1)  # muted: ignored
-        q.replay("asked for", "en", 2)
+        self.assertFalse(q.enqueue("live", "en", 1))
+        self.assertFalse(q.replay("asked for", "en", 2))
+        time.sleep(0.2)
+        self.assertEqual(player.played, [])
+        q.set_muted(False)  # new sentences only, no backlog
+        q.enqueue("after", "en", 3)
         self.assertTrue(wait_until(lambda: len(player.played) == 1))
-        time.sleep(0.1)
         q.stop()
-        self.assertEqual([u.text for u in playing], ["asked for"])
+        self.assertEqual([u.text for u in playing], ["after"])
 
     def test_cached_replay_not_held_by_rate_limit(self):
         q, synth, player, _, _ = running(per_minute=1)

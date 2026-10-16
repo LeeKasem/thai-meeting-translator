@@ -66,7 +66,7 @@ ICONS = {
     "chevron_down": "", "chevron_up": "", "arrow_down": "",
     "check": "", "translate": "", "globe": "", "voice": "",
     "lock": "", "warning": "", "skip": "", "replay": "",
-    "person": "",
+    "person": "", "fullscreen": "",
 }
 # Plain-Unicode fallbacks when no icon font is installed.
 ICON_FALLBACK = {
@@ -75,7 +75,7 @@ ICON_FALLBACK = {
     "people": "👥", "headphones": "🎧", "info": "ⓘ", "download": "⤓", "refresh": "↻",
     "font": "A", "chevron_down": "▾", "chevron_up": "▴", "arrow_down": "↓", "check": "✓",
     "translate": "文", "globe": "🌐", "voice": "🗣", "lock": "🔒", "warning": "⚠",
-    "skip": "⏭", "replay": "↻", "person": "👤",
+    "skip": "⏭", "replay": "↻", "person": "👤", "fullscreen": "⛶",
 }
 
 
